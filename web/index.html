@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>龙虾签到台 ClawCheckin</title>
+<link rel="stylesheet" href="/static/style.css?v=20260926b">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦞</text></svg>">
+</head>
+<body>
+
+<header class="header">
+  <div class="brand">
+    <div class="brand-logo">🦞</div>
+    <div><b>龙虾签到台</b><small>ClawCheckin · 每日自动签到</small></div>
+  </div>
+  <nav class="nav" id="nav">
+    <a data-page="overview" href="#overview" class="active">签到总览</a>
+    <a data-page="platforms" href="#platforms">平台接入</a>
+    <a data-page="calendar" href="#calendar">过期日历</a>
+    <a data-page="logs" href="#logs">运行日志</a>
+  </nav>
+  <div class="header-right">
+    <button class="btn-dark" id="btn-run-all">一键全部签到</button>
+  </div>
+</header>
+
+<main class="container">
+
+  <!-- ========== 签到总览 ========== -->
+  <section class="page active" id="page-overview">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">今日签到总览</h1>
+        <div class="page-sub" id="ov-sub">加载中…</div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <span class="badge ok" id="ov-schedule" style="display:none"></span>
+        <span class="badge gray" id="ov-date"></span>
+      </div>
+    </div>
+    <div id="ov-error"></div>
+    <div id="ov-body">
+      <div class="stat-grid" id="ov-stats"></div>
+      <div class="section-title">各平台签到状态</div>
+      <div class="card-grid" id="ov-platforms"></div>
+      <div class="section-title" id="ov-exp-title">最近七天即将过期积分</div>
+      <div id="ov-exp"></div>
+    </div>
+  </section>
+
+  <!-- ========== 平台接入 ========== -->
+  <section class="page" id="page-platforms">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">平台接入</h1>
+        <div class="page-sub" id="pf-sub">扫描中…</div>
+      </div>
+      <button class="btn-outline" id="btn-rescan">重新扫描目录</button>
+    </div>
+    <div class="tip-banner">不做配置表单：把脚本放进 <b>scripts/</b> 目录，面板自动发现，只按输出契约校验，字段不对才自己改脚本</div>
+    <div class="section-title" style="margin-top:16px;display:flex;justify-content:space-between;align-items:center;">
+      <span>已接入平台</span>
+      <a class="muted" style="font-size:12.5px;cursor:pointer" onclick="switchPage('logs')">查看运行日志</a>
+    </div>
+    <div class="card-grid" id="pf-cards"></div>
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">
+      <span>输出契约</span>
+      <span class="muted" style="font-size:12.5px;font-weight:400">脚本唯一要遵守的约定，其余一概不限制</span>
+    </div>
+    <div class="contract-block"><span class="cm">{</span>
+  <span class="kw">"result"</span>: <span class="kw">"CLAIMED"</span>,
+  <span class="kw">"report"</span>: <span class="kw">"成功领取 100 积分"</span>,
+  <span class="kw">"today_credit"</span>: 100,
+  <span class="kw">"streak_days"</span>: 7,
+  <span class="kw">"total_credits"</span>: 700,
+  <span class="cm">// 可选：平台返回积分有效期时才填，没有就整个省略</span>
+  <span class="kw">"expiring"</span>: [
+    { <span class="kw">"date"</span>: <span class="kw">"2026-09-25"</span>, <span class="kw">"amount"</span>: 320, <span class="kw">"source"</span>: <span class="kw">"每日签到"</span> }
+  ]
+<span class="cm">}</span>
+
+<span class="cm">result 取值：CLAIMED / ALREADY / NO_SESSION / NO_AUTH / NETWORK / ERROR —— 决定颜色、是否记帐、是否告警
+expiring 缺失 → 该平台不参与过期统计，总览与日历自动隐藏其条目，不报错、不占位</span></div>
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">
+      <span>接入体检</span>
+      <span class="muted" style="font-size:12.5px;font-weight:400">新脚本先跑体检单，通过才纳入调度</span>
+    </div>
+    <div class="check-list" id="pf-checks"></div>
+  </section>
+
+  <!-- ========== 过期日历 ========== -->
+  <section class="page" id="page-calendar">
+    <h1 class="page-title">过期日历</h1>
+    <div class="page-sub" id="cal-sub">加载中…</div>
+    <div class="week-grid-cards" id="cal-weeks"></div>
+    <div class="tip-banner" id="cal-tip" style="display:none"></div>
+    <div class="cal-grid" id="cal-grid"></div>
+    <div class="legend">
+      <span><i style="background:#e57373"></i>72 小时内到期</span>
+      <span><i style="background:#e6b84c"></i>3 - 4 天内到期</span>
+      <span><i style="background:#5cb89b"></i>5 天以上到期</span>
+      <span><i style="background:#9aa5b1"></i>第 4 周到期（28 天窗口末段）</span>
+    </div>
+  </section>
+
+  <!-- ========== 运行日志 ========== -->
+  <section class="page" id="page-logs">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">运行日志</h1>
+        <div class="page-sub" id="log-sub">加载中…</div>
+      </div>
+      <a class="btn-outline" id="btn-export" style="text-decoration:none;display:inline-block" href="/api/logs/export">导出 CSV</a>
+    </div>
+    <div class="chips" id="log-chips">
+      <button class="chip active" data-f="all">全部</button>
+      <button class="chip" data-f="success">成功</button>
+      <button class="chip" data-f="claimed">已签</button>
+      <button class="chip danger" data-f="failed">失败</button>
+    </div>
+    <div id="log-body"></div>
+    <div class="raw-block" id="log-raw"></div>
+  </section>
+
+</main>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<!-- 体检弹层 -->
+<div class="modal-mask" id="modal-mask">
+  <div class="modal">
+    <h3 id="modal-title">接入体检</h3>
+    <div class="sub" id="modal-sub"></div>
+    <div class="check-list" id="modal-checks"></div>
+    <div style="margin-top:18px;text-align:right">
+      <button class="btn-dark" onclick="document.getElementById('modal-mask').classList.remove('show')">好的</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js?v=20260926b"></script>
+</body>
+</html>

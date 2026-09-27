@@ -1,0 +1,25 @@
+# 运行时数据
+data/
+output/
+*.log
+logs/
+
+# 本地配置（含真实凭据，绝不提交）
+config.yaml
+auths/
+
+# 第三方参考克隆（仅本地参考，不入库）
+_ref_*/
+
+# 内置签到内核的运行日志（正常由包装脚本重定向到 data/，此处兜底）
+vendor/**/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 系统杂项
+.DS_Store
+Thumbs.db

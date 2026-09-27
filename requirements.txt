@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn>=0.29
+pyyaml>=6.0
+watchfiles>=0.21
+cryptography>=42  # AutoClaw 2 桌面端凭据自动提取（AES-GCM 解密，仅 Windows 用到）

@@ -1,0 +1,27 @@
+# config.example.yaml —— ClawCheckin 默认配置模板
+# 复制本文件为 config.yaml 并按需修改；本文件提交到仓库，不含任何真实凭据
+
+# 服务
+server:
+  host: 127.0.0.1     # 监听地址；局域网访问改为 0.0.0.0
+  port: 8317          # 面板端口
+
+# 签到脚本
+scripts:
+  dir: scripts        # 脚本目录：文件名即平台名，丢进来即被自动发现
+  timeout: 120        # 单脚本执行超时（秒）
+
+# 每日自动签到
+schedule:
+  enabled: true       # 到点自动把 scripts/ 下所有平台各跑一遍
+  time: "00:05"       # 触发时刻（HH:MM）；错过时刻（如关机）会在当日开机后补跑一次
+
+# 账本（SQLite）
+ledger:
+  db: data/ledger.db  # 签到日志与临期积分快照
+  retention_days: 90  # 日志本地保留天数，过期自动清理
+
+# 日志
+logging:
+  level: INFO         # DEBUG | INFO | WARNING | ERROR
+  file: ""            # 服务日志文件路径，留空为只输出到控制台

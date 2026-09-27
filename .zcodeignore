@@ -1,0 +1,55 @@
+# 运行时数据
+data/
+output/
+*.log
+logs/
+
+# 本地配置（含真实凭据，绝不提交）
+config.yaml
+auths/
+
+# 第三方参考克隆（仅本地参考，不入库）
+_ref_*/
+
+# 内置签到内核的运行日志（正常由包装脚本重定向到 data/，此处兜底）
+vendor/**/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+node_modules/
+bower_components/
+jspm_packages/
+site-packages/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）
