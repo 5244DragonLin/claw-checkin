@@ -20,7 +20,7 @@ rem ---- 手动模式：实时显示签到结果，按任意键关闭 ----
 python main.py --run-once
 set RC=%errorlevel%
 echo.
-echo [ClawCheckin] 结果已写入账本 data/ledger.db，运行 start.bat 可在面板查看
+echo [ClawCheckin] 结果已写入账本 data/ledger.json，运行 start.bat 可在面板查看
 echo [ClawCheckin] 按任意键关闭窗口...
 pause >nul
 exit /b %RC%

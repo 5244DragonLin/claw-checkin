@@ -41,6 +41,9 @@ import urllib.error
 import urllib.request
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _autoclaw_credsync as credsync  # noqa: E402  同目录共享模块：跨机会话漫游镜像
+
 APP_ID = "100003"
 APP_SECRET = "38d2391985e2369a5fb8227d8e6cd5e5"
 CLIENT_VER = "1.18.5"
@@ -66,19 +69,12 @@ OPENCLAW_RUNTIME = os.path.join(os.path.expanduser("~"), ".openclaw-autoclaw", "
 
 
 def _load_state() -> dict:
-    if os.path.isfile(STATE_FILE):
-        try:
-            with open(STATE_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"total_credits": 0, "streak_days": 0, "last_date": ""}
+    """读取积分状态（自动合并同步盘冲突副本，见 _autoclaw_credsync）。"""
+    return credsync.load_state()
 
 
 def _save_state(state: dict):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False)
+    credsync.save_state(state)
 
 
 def _sign(ts: str) -> str:
@@ -275,8 +271,11 @@ def _autoclaw2_running() -> bool:
     客户端下次刷新失败而要求重新登录，故运行期间不碰凭据库）。"""
     try:
         for name in AUTOCCLAW2_PROCESSES:
+            # 中文 Windows 的 tasklist 输出是 GBK：不指定解码会让读取线程崩掉、
+            # stdout 变空，客户端运行中会被误判为未运行而误写凭据库
             out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}"],
-                                 capture_output=True, text=True).stdout or ""
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace").stdout or ""
             if name.lower() in out.lower():
                 return True
     except Exception:
@@ -364,21 +363,31 @@ def _upsert_autoclaw_auth(auth_dir: str, access: str, exp: float) -> bool:
 
 
 def _refresh_from_autoclaw2(auth_dir: str) -> bool:
-    """AutoClaw 2 凭据自动就绪：token 有效直接采用；过期且客户端未运行时
-    用 refreshToken 自主续期并写回凭据库——签到无需客户端参与。"""
+    """AutoClaw 2 凭据自动就绪：本地凭据库优先（token 有效直接采用；过期且
+    客户端未运行时用 refreshToken 自主续期并写回凭据库），走不通时退回跨机
+    会话镜像 auths/autoclaw_sync.json（同步盘双机轮流使用，见 _autoclaw_credsync）。
+    """
     vault = _read_autoclaw2_vault()
-    if not vault:
-        return False
-    if vault["exp"] > time.time() + 300:
-        return _upsert_autoclaw_auth(auth_dir, vault["access"], vault["exp"])
-    if _autoclaw2_running():
-        return False  # 客户端运行中会自行轮换，不并发写凭据库
-    renewed = _autoclaw2_remote_refresh(vault["refresh"], _autoclaw2_device_id(), vault["access"])
-    if not renewed:
-        return False
-    _write_autoclaw2_vault(vault, renewed["access"], renewed["refresh"])
-    return _upsert_autoclaw_auth(auth_dir, renewed["access"],
-                                 _jwt_exp(renewed["access"].split(" ", 1)[-1]))
+    device_id = _autoclaw2_device_id()
+    if vault:
+        credsync.note(vault["access"], vault["refresh"], vault["exp"], device_id)
+        if vault["exp"] > time.time() + 300:
+            return _upsert_autoclaw_auth(auth_dir, vault["access"], vault["exp"])
+        if not _autoclaw2_running():
+            renewed = _autoclaw2_remote_refresh(vault["refresh"], device_id, vault["access"])
+            if renewed:
+                _write_autoclaw2_vault(vault, renewed["access"], renewed["refresh"])
+                credsync.note(renewed["access"], renewed["refresh"],
+                              _jwt_exp(renewed["access"].split(" ", 1)[-1]), device_id)
+                return _upsert_autoclaw_auth(auth_dir, renewed["access"],
+                                             _jwt_exp(renewed["access"].split(" ", 1)[-1]))
+    return credsync.fallback_refresh(
+        auth_dir,
+        upsert=_upsert_autoclaw_auth,
+        remote_refresh=_autoclaw2_remote_refresh,
+        jwt_exp=_jwt_exp,
+        vault=vault, vault_writer=_write_autoclaw2_vault,
+        client_running=_autoclaw2_running)
 
 
 def _http_json(method: str, url: str, token: str, body: dict | None) -> tuple:
@@ -515,6 +524,7 @@ def main():
     # 权威余额与临期明细由 autoclaw_credits 查询，不再在此请求钱包接口。
     if today_points > 0:
         state["total_credits"] = state.get("total_credits", 0) + today_points
+        state["last_daily"] = today_points
     if today_points > 0 and state.get("last_date") != today:
         state["streak_days"] = state.get("streak_days", 0) + 1
         state["last_date"] = today
@@ -533,6 +543,13 @@ def main():
             "total_credits": total,
         }, ensure_ascii=False))
         return 1
+
+    # 已签到场景：API 可能返回 reward_points=0，改用本地记录的实际值
+    if r["already_completed"] and r["reward_points"] == 0 and state.get("last_date") == today:
+        r["reward_points"] = state.get("last_daily", 0)
+        r["report"] = f"今日已签到（+{r['reward_points']} 积分）"
+        if r["balance"] is not None:
+            r["report"] += f"，余额 {r['balance']} 积分"
 
     # 签到成功
     print(json.dumps({

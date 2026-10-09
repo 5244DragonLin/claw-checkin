@@ -11,6 +11,22 @@ auths/
 # 第三方参考克隆（仅本地参考，不入库）
 _ref_*/
 
+# 第三方官方素材（仅本地参考图标，不入库）
+assets/_official_*/
+
+# 开发期临时验证脚本（下划线开头，均不被主代码引用）
+# 例外：_autoclaw_credsync 是「同步盘双机」功能的共享模块，被 autoclaw.py /
+# autoclaw_credits.py import，必须入库
+scripts/_verify_*.py
+scripts/_verify_*.mjs
+scripts/_sync*.py
+scripts/_raccoon_*.py
+scripts/_wb*.py
+_rp.py
+
+# AI 助手工作目录（项目记忆与本地配置，不属于代码）
+.workbuddy/
+
 # 内置签到内核的运行日志（正常由包装脚本重定向到 data/，此处兜底）
 vendor/**/*.log
 

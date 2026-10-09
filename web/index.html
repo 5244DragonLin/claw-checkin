@@ -3,17 +3,29 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>龙虾签到台 ClawCheckin</title>
-<link rel="stylesheet" href="/static/style.css?v=20260926b">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦞</text></svg>">
+<title>龙虾签到台</title>
+<link rel="stylesheet" href="/static/style.css?v=20261009k">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 140 140'><text x='70' y='1.2em' font-size='90' text-anchor='middle'>🦞</text></svg>">
+<script>
+  // 主题必须在首次渲染前定好，否则暗色用户会先闪一下白底。
+  // 三档：跟随系统(空串) / 强制暗色(dark) / 强制浅色(light)
+  (function () {
+    try {
+      var t = localStorage.getItem("cc-theme") || "";
+      if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      if (t === "dark") document.documentElement.setAttribute("data-theme", "dark");
+      else document.documentElement.setAttribute("data-theme", "light");
+    } catch (e) {}
+  })();
+</script>
 </head>
 <body>
 
 <header class="header">
-  <div class="brand">
+  <a class="brand" href="#overview" id="brand-home" title="返回首页">
     <div class="brand-logo">🦞</div>
     <div><b>龙虾签到台</b><small>ClawCheckin · 每日自动签到</small></div>
-  </div>
+  </a>
   <nav class="nav" id="nav">
     <a data-page="overview" href="#overview" class="active">签到总览</a>
     <a data-page="platforms" href="#platforms">平台接入</a>
@@ -21,6 +33,8 @@
     <a data-page="logs" href="#logs">运行日志</a>
   </nav>
   <div class="header-right">
+    <button class="theme-toggle" id="btn-theme" onclick="toggleTheme()" title="切换深色 / 浅色">🌙</button>
+    <button class="btn-outline" id="btn-refresh-credits" onclick="refreshCredits(false)">刷新积分</button>
     <button class="btn-dark" id="btn-run-all">一键全部签到</button>
   </div>
 </header>
@@ -97,10 +111,10 @@ expiring 缺失 → 该平台不参与过期统计，总览与日历自动隐藏
     <div class="tip-banner" id="cal-tip" style="display:none"></div>
     <div class="cal-grid" id="cal-grid"></div>
     <div class="legend">
-      <span><i style="background:#e57373"></i>72 小时内到期</span>
-      <span><i style="background:#e6b84c"></i>3 - 4 天内到期</span>
-      <span><i style="background:#5cb89b"></i>5 天以上到期</span>
-      <span><i style="background:#9aa5b1"></i>第 4 周到期（28 天窗口末段）</span>
+      <span><i style="background:#fde3e0;border:1px solid #f3c9c3"></i>第 1 周</span>
+      <span><i style="background:#fde6d2;border:1px solid #f3d3b0"></i>第 2 周</span>
+      <span><i style="background:#fbf1cf;border:1px solid #ece0ae"></i>第 3 周</span>
+      <span><i style="background:#dcefe9;border:1px solid #b9ded3"></i>第 4 周</span>
     </div>
   </section>
 
@@ -111,7 +125,10 @@ expiring 缺失 → 该平台不参与过期统计，总览与日历自动隐藏
         <h1 class="page-title">运行日志</h1>
         <div class="page-sub" id="log-sub">加载中…</div>
       </div>
-      <a class="btn-outline" id="btn-export" style="text-decoration:none;display:inline-block" href="/api/logs/export">导出 CSV</a>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <a class="btn-outline" id="btn-export" style="text-decoration:none;display:inline-block" href="/api/logs/export">导出 CSV</a>
+        <button class="btn-outline danger-outline" id="btn-clear-logs" style="display:inline-block">清空日志</button>
+      </div>
     </div>
     <div class="chips" id="log-chips">
       <button class="chip active" data-f="all">全部</button>
@@ -139,6 +156,6 @@ expiring 缺失 → 该平台不参与过期统计，总览与日历自动隐藏
   </div>
 </div>
 
-<script src="/static/app.js?v=20260926b"></script>
+<script src="/static/app.js?v=20261009k"></script>
 </body>
 </html>

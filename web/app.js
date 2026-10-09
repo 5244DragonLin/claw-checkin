@@ -5,10 +5,12 @@ const $ = (sel) => document.querySelector(sel);
 const PLATFORM_ICON = {
   workbuddy: "/static/icons/workbuddy.svg",
   autoclaw: "/static/icons/autoclaw.png",
+  商汤小浣熊: "/static/icons/raccoon.png",
 };
 const DISPLAY_NAMES = {
   workbuddy_credits: "WorkBuddy 积分",
   autoclaw_credits: "AutoClaw 积分",
+  商汤小浣熊_credits: "商汤小浣熊积分",
 };
 const displayName = (name) => DISPLAY_NAMES[name] || name;
 const iconFor = (name) => {
@@ -41,9 +43,15 @@ function switchPage(name, syncHash = true) {
   if (syncHash && location.hash !== `#${name}`) {
     history.replaceState(null, "", `#${name}`);
   }
-  if (name === "overview") loadOverview();
+  if (name === "overview") loadOverview(ovRendered);
   if (name === "platforms") loadPlatforms();
-  if (name === "calendar") loadCalendar();
+  if (name === "calendar") {
+    // 首次进入显示骨架屏；再次进入静默刷新，保持上一屏不闪
+    loadCalendar(calRendered);
+    // 日历展示的是「今天即将过期多少分」，必须紧跟平台最新余额：静默补跑积分源
+    // （服务端30 秒防抖，反复切页不反复跑脚本），成功后自动用真实数据重画
+    refreshCredits(true, "page_load");
+  }
   if (name === "logs") loadLogs();
 }
 document.querySelectorAll("#nav a").forEach((a) =>
@@ -51,6 +59,10 @@ document.querySelectorAll("#nav a").forEach((a) =>
     ev.preventDefault();           // 纯前端切换：不走链接跳转、不做整页刷新
     switchPage(a.dataset.page);
   }));
+$("#brand-home").addEventListener("click", (ev) => {
+  ev.preventDefault();             // 品牌区点击回首页：与导航同一套纯前端切换
+  switchPage("overview");
+});
 window.addEventListener("hashchange", () => {
   const name = location.hash.slice(1);
   if (name && name !== currentPage()) switchPage(name, false);
@@ -91,15 +103,30 @@ function skeletonCards(n, h) {
 }
 
 /* ---------- 签到总览 ---------- */
-async function loadOverview() {
-  $("#ov-body").style.display = "none";
-  $("#ov-error").innerHTML = "";
-  $("#ov-sub").textContent = "加载中…";
+// 总览页静默刷新：已有画面时不再display:none 整体藏掉重画，
+// 否则每 60 秒轮询都会让整页内容闪一下。
+let ovRendered = false;
+let ovFingerprint = "";
+async function loadOverview(silent = false) {
+  const quiet = silent && ovRendered;
+  if (!quiet) {
+    $("#ov-body").style.display = "none";
+    $("#ov-error").innerHTML = "";
+    $("#ov-sub").textContent = "加载中…";
+  }
   try {
     const data = await api("/api/overview");
+    // 数据未变则整段跳过渲染，避免无谓的 DOM 重写（重写同样会造成闪动）
+    const fp = JSON.stringify([data.platforms.map((p) => [p.name, p.status, p.credits,
+      p.streak, p.expiring_14d, p.today_ok]), data.total_credits, data.expiring_14d,
+      data.done_count, data.today]);
+    if (quiet && fp === ovFingerprint) return;
     renderOverview(data);
     $("#ov-body").style.display = "";
+    ovFingerprint = fp;
+    ovRendered = true;
   } catch (e) {
+    if (quiet) return;         // 静默刷新失败：保留现有画面，等下一轮
     $("#ov-error").innerHTML = `<div class="error-banner"><b>数据加载失败</b>
       <small>${esc(e.message)} · 面板服务可能未启动，请检查 python main.py</small></div>`;
     $("#ov-sub").textContent = "加载失败";
@@ -204,6 +231,7 @@ async function runOne(name, btn) {
     else
       toast(`${name} 签到失败`, r.report || r.result, "fail");
     loadOverview();
+    refreshCredits();   // 积分源跟着补跑，余额立即反映本次签到后的最新值
   } catch (e) {
     toast(`${name} 签到失败`, e.message, "fail");
     if (btn) { btn.disabled = false; btn.textContent = "立即签到"; }
@@ -231,6 +259,49 @@ $("#btn-run-all").addEventListener("click", async (ev) => {
 function scanNow() {
   switchPage("platforms");
   doScan();
+}
+
+/* ---------- 积分余额刷新 ---------- */
+// 积分源脚本只查余额、不签到；消耗积分后点这个按钮立刻拿到最新值
+let refreshBusy = false;
+async function refreshCredits(silent = true, source = "button") {
+  const btn = $("#btn-refresh-credits");
+  if (refreshBusy) {
+    if (!silent) toast("积分刷新中", "上一次刷新还没跑完，稍等片刻", "ok");
+    return null;
+  }
+  refreshBusy = true;
+  // 按钮的「刷新中…」只给用户手动点击用：页面加载、60 秒轮询、切到日历页
+  // 触发的后台补跑都不该动按钮，否则一进页面右上角就在转，像出了故障
+  const showBtn = !silent && !!btn;
+  if (showBtn) { btn.disabled = true; btn.textContent = "刷新中…"; }
+  try {
+    const r = await api(`/api/refresh_credits?source=${encodeURIComponent(source)}`, { method: "POST" });
+    if (r.skipped) {
+      // 页面加载防抖窗口内（或已有刷新在跑）：账本里已是刚刷新过的值，无需重拉
+      if (!silent) toast("积分刚刚刷新过", "短时间内无需重复刷新", "ok");
+    } else {
+      if (!silent) {
+        const fail = r.results.filter((x) => !x.ok);
+        toast("积分已刷新", `${r.ok} / ${r.ran} 个积分源成功` +
+          (fail.length ? `，失败：${fail.map((f) => f.platform).join("、")}` : ""),
+          fail.length ? "fail" : "ok");
+      }
+      // 必须传 true：静默刷新只在数据真的变了才重画 DOM。
+      // 漏传会让已渲染的总览被清空成「加载中…」再画一次——
+      // 积分补跑要 1~2 秒，这期间用户正看着已渲染好的面板被抹掉重来。
+      loadOverview(true);
+      // 日历页也吃临期快照数据；静默刷新避免画面闪动（已有画面时不清空重建）
+      if (currentPage() === "calendar") loadCalendar(true);
+    }
+    return r;
+  } catch (e) {
+    if (!silent) toast("积分刷新失败", e.message, "fail");
+    return null;
+  } finally {
+    refreshBusy = false;
+    if (showBtn) { btn.disabled = false; btn.textContent = "刷新积分"; }
+  }
 }
 
 /* ---------- 平台接入 ---------- */
@@ -332,20 +403,47 @@ function renderChecksInto(el, h, withPlatform) {
 }
 $("#btn-rescan").addEventListener("click", () => doScan().catch((e) => toast("扫描失败", e.message, "fail")));
 
+// 日历格子配色：底色按「第几周」取，与上方 4 张周卡片一一对应。
+// 紧急度只用上方总览的「最近天数」与图例文字说明表达，格子里不再叠色条，
+// 避免同一格出现两套颜色干扰「看颜色 = 看周」这层信息。
+const CAL_WEEK_CLASS = ["cal-w1", "cal-w2", "cal-w3", "cal-w4"];
+function calCellClass(i) {
+  return CAL_WEEK_CLASS[Math.min(Math.floor(i / 7), 3)];
+}
+
 /* ---------- 过期日历 ---------- */
-async function loadCalendar() {
-  $("#cal-sub").textContent = "加载中…";
-  $("#cal-grid").innerHTML = skeletonCards(28, 96);
-  $("#cal-weeks").innerHTML = skeletonCards(3, 90);
+// 日历自动刷新时的视觉策略（配合后台每60 秒轮询、窗口切回补刷）：
+// ① 已有数据时刷新不再清空成骨架屏——保持旧画面，等新数据到了原地替换，
+//    避免每隔一分钟 28 个格子集体闪成灰块；
+// ② 数据与上次完全一致时连DOM 都不重写，做到真正无感。
+let calRendered = false;      // 是否已成功渲染过一次（决定要不要显示骨架屏）
+let calFingerprint = "";      // 上次渲染的数据指纹，用于判断有无变化
+
+function calFingerprintOf(d, ov) {
+  return JSON.stringify([d.weeks, d.void30, d.days.map((x) => [x.date, x.amount]),
+    ov ? ov.expiring_covered : -1, ov ? ov.platform_count : -1]);
+}
+
+async function loadCalendar(silent = false) {
+  // 静默刷新（已有画面）：不铺骨架屏、不改副标题，先渲染完再原子替换
+  const quiet = silent && calRendered;
+  if (!quiet) {
+    $("#cal-sub").textContent = "加载中…";
+    $("#cal-grid").innerHTML = skeletonCards(28, 96);
+    $("#cal-weeks").innerHTML = skeletonCards(3, 90);
+  }
   try {
     const d = await api("/api/expiring");
     const ov = await api("/api/overview");
+    // 数据没变就整段跳过：避免无谓的 DOM 重写（重写本身也会造成视觉闪动）
+    const fp = calFingerprintOf(d, ov);
+    if (quiet && fp === calFingerprint) return;
     const total28 = d.weeks.reduce((a, b) => a + b, 0);
     $("#cal-sub").textContent =
       `未来 28 天共 ${d.days.filter((x) => x.amount > 0).length} 笔积分将过期 · 合计 ${fmtNum(total28)} 分` +
       (ov ? ` · 数据来自 ${ov.expiring_covered} / ${ov.platform_count} 个平台` : "");
     const weekLabels = ["第 1 周", "第 2 周", "第 3 周", "第 4 周"];
-    const weekStyles = ["stat-yellow", "stat-pink", "stat-orange", "stat-teal"];
+    const weekStyles = ["stat-w1", "stat-w2", "stat-w3", "stat-w4"];
     $("#cal-weeks").innerHTML =
       d.weeks.map((w, i) =>
         `<div class="week-card ${weekStyles[i]}"><div class="label">${weekLabels[i]}</div><div class="value">${fmtNum(w)} 分</div></div>`
@@ -358,18 +456,20 @@ async function loadCalendar() {
     } else {
       $("#cal-tip").style.display = "none";
     }
-    $("#cal-grid").innerHTML = d.days.map((day) => {
+    $("#cal-grid").innerHTML = d.days.map((day, i) => {
       if (!day.amount) {
         return `<div class="cal-cell empty"><div class="d">${day.date.slice(5)} · ${day.weekday}</div>
           <div class="p">无到期积分</div><div class="v">—</div></div>`;
       }
-      const days = Math.round((new Date(day.date) - new Date(new Date().toDateString())) / 86400000);
-      const cls = days <= 2 ? "cal-red" : days <= 4 ? "cal-orange" : "cal-teal";
+      const cls = calCellClass(i);
       const plats = [...new Set(day.items.map((i) => i.platform))].join("、");
-      return `<div class="cal-cell ${cls}"><div class="d">${day.date.slice(5)} · ${day.weekday}</div>
+      return `<div class="cal-cell wk ${cls}"><div class="d">${day.date.slice(5)} · ${day.weekday}</div>
         <div class="p">${esc(plats)}</div><div class="v">${fmtNum(day.amount)}</div></div>`;
     }).join("");
+    calFingerprint = fp;
+    calRendered = true;
   } catch (e) {
+    if (quiet) return;         // 静默刷新失败：保留现有画面，等下一轮
     $("#cal-sub").textContent = "加载失败";
     $("#cal-weeks").innerHTML = `<div class="error-banner" style="grid-column:1/-1"><b>数据拉取失败</b><small>${esc(e.message)}，已保留上次缓存数据</small>
       <button class="btn-dark" style="margin-top:10px" onclick="loadCalendar()">重新加载</button></div>`;
@@ -386,6 +486,21 @@ document.querySelectorAll("#log-chips .chip").forEach((chip) =>
     logPage = 1;
     loadLogs();
   }));
+$("#btn-clear-logs").addEventListener("click", async (ev) => {
+  if (!confirm("确定清空全部运行日志？此操作不可恢复。\n注意：清空后当日定时签到判重记录也会丢失，重启面板后调度器会重新补跑一轮（平台会安全返回今日已签）。"))
+    return;
+  const btn = ev.currentTarget;
+  btn.disabled = true; btn.textContent = "清空中…";
+  try {
+    const r = await api("/api/logs/clear", { method: "POST" });
+    toast("日志已清空", `共删除 ${r.deleted} 条记录`, "ok");
+    logPage = 1;
+    loadLogs(1);
+  } catch (e) {
+    toast("清空失败", e.message, "fail");
+  }
+  btn.disabled = false; btn.textContent = "清空日志";
+});
 function pagerHtml(page, totalPages, total) {
   if (totalPages <= 1) return "";
   const btn = (p, label, disabled) =>
@@ -409,7 +524,7 @@ async function loadLogs(page = logPage) {
     const d = await api(`/api/logs?filter_name=${logFilter}&limit=${LOG_PAGE_SIZE}&offset=${offset}`);
     const totalPages = Math.max(1, Math.ceil(d.total / LOG_PAGE_SIZE));
     // 从全量日志统计今日数字（简版：用当前返回展示条数）
-    $("#log-sub").textContent = "数据来源：各脚本 stdout 的一行 JSON + data/ledger.db 的 checkin_log 表 · 本地保留 90 天";
+    $("#log-sub").textContent = "数据来源：各脚本 stdout 的一行 JSON + data/ledger.json 的 checkin_log 表 · 本地保留 90 天";
     if (!d.logs.length) {
       if (page > 1) { loadLogs(1); return; }
       if (logFilter === "all") {
@@ -457,5 +572,66 @@ function runAllFromLogs() {
 /* ---------- 启动 ---------- */
 // 带 #logs 之类 hash 打开（或刷新）时直接还原到那一页，默认总览
 switchPage(PAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : "overview", false);
-// 启动后积分源在后台补跑，10 秒后重拉一次总览让卡片余额跟上
-setTimeout(() => { if (currentPage() === "overview") loadOverview(); }, 10000);
+// 每次整页加载（浏览器刷新/新开）自动补跑一次积分源，卡片余额即最新值：
+// 先用账本数据立即渲染，后台刷新完成后 loadOverview 用最新值重渲染。
+// 服务端有防抖（credits.page_load_debounce，默认 30 秒），F5 连点不会反复跑脚本；
+// silent=true 不弹提示，刷新失败也静默（60 秒轮询与右上角按钮兜底）
+refreshCredits(true, "page_load");
+// 总览余额与过期日历每 60 秒静默重拉（后台 refresh 线程每 5 分钟补跑积分源；
+// 只拉数据不跑脚本，页面切到后台时暂停，回到前台立即补拉一次）。
+// 全部走静默模式：已有画面不清空重建，数据无变化时连 DOM 都不重写，
+// 轮询不会造成整页闪动。
+const OVERVIEW_POLL_MS = 60000;
+setInterval(() => {
+  if (document.hidden) return;
+  if (currentPage() === "overview") loadOverview(true);
+  // 日历页同样要跟着刷新：当日到期格随积分消耗实时变化，停留不动也得更新
+  // （refreshCredits 内部会在补跑成功后静默重载日历）
+  if (currentPage() === "calendar") refreshCredits(true, "page_load");
+}, OVERVIEW_POLL_MS);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (currentPage() === "overview") loadOverview(true);
+  if (currentPage() === "calendar") refreshCredits(true, "page_load");
+});
+
+/* ---------- 深色 / 浅色主题 ----------
+   颜色全部由 style.css 的 CSS 变量承载，这里只切<html data-theme>，
+   不碰任何具体色值——所以切主题不需要重绘页面，改完立刻生效。
+   主题在 index.html <head> 的内联脚本里已先于首屏渲染定过一次，
+   这里只负责「用户点按钮切换」和「按钮图标跟随当前主题」。 */
+const THEME_KEY = "cc-theme";
+
+// 读取生效主题：优先用户显式选择，没有则跟随系统
+function currentTheme() {
+  const v = document.documentElement.getAttribute("data-theme");
+  return v === "dark" ? "dark" : "light";
+}
+
+// 只切属性，不重载数据、不重建 DOM
+function applyTheme(theme, persist) {
+  document.documentElement.setAttribute("data-theme", theme);
+  const btn = $("#btn-theme");
+  if (btn) {
+    // 亮色下显示月亮（点一下进暗色），暗色下显示太阳（点一下回亮色）
+    btn.textContent = theme === "dark" ? "☀️" : "🌙";
+    btn.title = theme === "dark" ? "切换到浅色模式" : "切换到深色模式";
+  }
+  if (persist) {
+    try { localStorage.setItem(THEME_KEY, theme); } catch (e) {}
+  }
+}
+
+function toggleTheme() {
+  applyTheme(currentTheme() === "dark" ? "light" : "dark", true);
+}
+
+// 同步按钮图标（首屏时内联脚本已设好属性，这里补上按钮文案）
+applyTheme(currentTheme(), false);
+
+// 用户把系统主题切了、且自己没有显式选择过时，跟着系统走
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+  let saved = "";
+  try { saved = localStorage.getItem(THEME_KEY) || ""; } catch (err) {}
+  if (!saved) applyTheme(e.matches ? "dark" : "light", false);
+});

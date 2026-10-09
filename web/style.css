@@ -15,6 +15,9 @@
   --radius: 14px;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
+/* 永久预留右侧滚动条槽位（默认 auto 只在内容超一屏时才腾出约 15px）：
+   各页切换时居中容器左右各偏移半个滚动条宽，表现为内容整体一抖。 */
+html { scrollbar-gutter: stable; }
 body {
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
   background: var(--bg); color: var(--text); font-size: 14px;
@@ -25,7 +28,7 @@ button { font-family: inherit; cursor: pointer; }
 /* ---------- 头部 ---------- */
 .header {
   position: sticky; top: 0; z-index: 20;
-  background: rgba(255,255,255,.92); backdrop-filter: blur(8px);
+  background: var(--head-bg); backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
   display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
   padding: 0 28px; height: 58px;
@@ -33,12 +36,13 @@ button { font-family: inherit; cursor: pointer; }
 .brand { justify-self: start; }
 .nav { justify-self: center; }
 .header-right { justify-self: end; }
-.brand { display: flex; align-items: center; gap: 10px; }
+.brand { display: flex; align-items: center; gap: 10px; color: inherit; text-decoration: none; cursor: pointer; border-radius: 10px; }
 .brand-logo {
-  width: 34px; height: 34px; border-radius: 10px; background: var(--dark);
+  width: 34px; height: 34px; border-radius: 10px; background: transparent;
   display: flex; align-items: center; justify-content: center; font-size: 18px;
 }
-.brand b { font-size: 15px; }
+.brand b { font-size: 15px; transition: color .15s; }
+.brand:hover b { color: var(--link); }
 .brand small { color: var(--muted); margin-left: 8px; font-size: 12px; }
 .nav { display: flex; gap: 26px; }
 .nav a {
@@ -47,14 +51,16 @@ button { font-family: inherit; cursor: pointer; }
 .nav a.active { color: var(--text); font-weight: 600; border-bottom: 2px solid var(--text); }
 .header-right { display: flex; align-items: center; gap: 14px; }
 .btn-dark {
-  background: var(--dark); color: #fff; border: none; border-radius: 22px;
+  background: var(--dark); color: var(--on-accent); border: none; border-radius: 22px;
   padding: 9px 18px; font-size: 13px; font-weight: 600;
 }
 .btn-dark:hover { opacity: .85; }
 .btn-dark:disabled { opacity: .45; cursor: not-allowed; }
 
 /* ---------- 布局 ---------- */
-.container { max-width: 1180px; margin: 0 auto; padding: 26px 28px 60px; }
+/* 1500px：大屏（2K / 2560 宽）上格子更大更舒展，不再左右留大片空白；
+   窄屏不受影响——容器本身是 max-width，窗口窄时按实际宽度自适应。 */
+.container { max-width: 1500px; margin: 0 auto; padding: 26px 28px 60px; }
 .page { display: none; }
 .page.active { display: block; animation: fadein .18s ease; }
 @keyframes fadein { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; } }
@@ -63,21 +69,63 @@ h1.page-title { font-size: 26px; font-weight: 800; letter-spacing: .5px; }
 .page-sub { color: var(--muted); margin-top: 6px; font-size: 13px; }
 .section-title { font-size: 16px; font-weight: 700; margin: 30px 0 14px; }
 .tip-banner {
-  background: #fbf7e3; border: 1px solid #f0e6bd; color: #7a6420;
+  background: var(--tip-bg); border: 1px solid var(--tip-bd); color: var(--tip-tx);
   border-radius: 10px; padding: 11px 16px; font-size: 13px; margin: 16px 0;
 }
 
 /* ---------- 统计卡 ---------- */
 .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-top: 20px; }
-.stat-card { border-radius: var(--radius); padding: 18px 20px; border: 1px solid rgba(0,0,0,.04); }
+.stat-card { border-radius: var(--radius); padding: 18px 20px; border: 1px solid var(--card-line); }
 .stat-card .label { font-size: 13px; opacity: .75; }
 .stat-card .value { font-size: 32px; font-weight: 800; margin-top: 6px; letter-spacing: .5px; }
 .stat-card .note { font-size: 12px; opacity: .65; margin-top: 8px; }
-.stat-yellow { background: #fcf3d4; color: #6e5711; }
-.stat-pink { background: #fae3ed; color: #8e3a5f; }
-.stat-orange { background: #fdebd8; color: #95591c; }
-.stat-teal { background: #d9f3ec; color: #116a54; }
-.stat-gray { background: #f1f1ef; color: #7c7c76; }
+/* 总览统计卡配色（与日历无关，保持原样） */
+.stat-yellow { background: var(--sy-bg); color: var(--sy-tx); }
+.stat-pink { background: var(--sp-bg); color: var(--sp-tx); }
+.stat-orange { background: var(--so-bg); color: var(--so-tx); }
+.stat-teal { background: var(--st-bg); color: var(--st-tx); }
+/* ---------- 过期日历 4 档色阶 ----------
+   只用于日历周卡片与格子（第1周→第4周 = 越早到期越红）。
+   两处共用同一组变量，保证上下永远同色。 */
+:root {
+  --w1-bg: #fde3e0; --w1-tx: #9e2b1f; --w1-bd: #f3c9c3; --w1-sm: #a8564a;
+  --w2-bg: #fde6d2; --w2-tx: #8f5310; --w2-bd: #f3d3b0; --w2-sm: #a3712f;
+  --w3-bg: #fbf1cf; --w3-tx: #6e5711; --w3-bd: #ece0ae; --w3-sm: #8a7433;
+  --w4-bg: #dcefe9; --w4-tx: #14614f; --w4-bd: #b9ded3; --w4-sm: #3a8b76;
+
+  /* 暗色模式要切换的补充色板（此处为亮色取值） */
+  --head-bg: rgba(255,255,255,.92);
+  --link: #4a6bdc;
+  --on-accent: #ffffff;
+  --tip-bg: #fbf7e3; --tip-bd: #f0e6bd; --tip-tx: #7a6420;
+  --tip2-bg: #fbf7e3; --tip2-tx: #7a6420;
+  --sy-bg: #fcf3d4; --sy-tx: #6e5711;
+  --sp-bg: #fae3ed; --sp-tx: #8e3a5f;
+  --so-bg: #fdebd8; --so-tx: #95591c;
+  --st-bg: #d9f3ec; --st-tx: #116a54;
+  --gray-bg: #f1f1ef; --gray-tx: #7c7c76;
+  --badge-gray-bg: #f0f0ee;
+  --btn-ghost-bg: #f6f6f4;
+  --tag-bg: #f4f4f2; --tag-tx: #55554f;
+  --row-alt: #fafaf8;
+  --row-line: #f3f3f1;
+  --empty-tx: #c9c9c4;
+  --legend-bd: #d8d8d4;
+  --code-bg: #23231f; --on-dark: #e8e6df;
+  --code-dim: #8a8878; --code-kw: #f2c94c;
+  --code-bg2: #23231f; --code-fg2: #d8d6cd;
+  --ok-tx: #2e7d43; --fail-tx: #c0392b;
+  --fail-bd: #f3c6c6; --danger-bd: #eec7c2; --err-bd: #f2caca;
+  --skel-a: #eeeeec; --skel-b: #f6f6f4;
+  --card-shadow: rgba(0,0,0,.09);
+  --card-line: rgba(0,0,0,.04);
+  --mask: rgba(0,0,0,.35);
+}
+.stat-w1 { background: var(--w1-bg); color: var(--w1-tx); }
+.stat-w2 { background: var(--w2-bg); color: var(--w2-tx); }
+.stat-w3 { background: var(--w3-bg); color: var(--w3-tx); }
+.stat-w4 { background: var(--w4-bg); color: var(--w4-tx); }
+.stat-gray { background: var(--gray-bg); color: var(--gray-tx); }
 
 /* ---------- 平台卡片 ---------- */
 .card-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
@@ -85,7 +133,7 @@ h1.page-title { font-size: 26px; font-weight: 800; letter-spacing: .5px; }
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 18px; display: flex; flex-direction: column; gap: 12px;
 }
-.platform-card.failed { border-color: #f3c6c6; }
+.platform-card.failed { border-color: var(--fail-bd); }
 .pc-head { display: flex; align-items: center; justify-content: space-between; }
 .pc-name { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 15px; }
 .pc-icon { width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center; background: transparent; overflow: hidden; }
@@ -95,31 +143,31 @@ h1.page-title { font-size: 26px; font-weight: 800; letter-spacing: .5px; }
 .badge.pending { background: var(--yellow-bg); color: var(--yellow-tx); }
 .badge.fail { background: var(--red-bg); color: var(--red-tx); }
 .badge.warn { background: var(--orange-bg); color: var(--orange-tx); }
-.badge.gray { background: #f0f0ee; color: var(--muted); }
+.badge.gray { background: var(--badge-gray-bg); color: var(--muted); }
 .pc-credits { font-size: 26px; font-weight: 800; }
 .pc-meta { color: var(--muted); font-size: 12px; line-height: 1.7; }
 .pc-meta b { color: var(--text); font-weight: 600; }
 .pc-btn {
-  border: 1px solid var(--border); background: #f6f6f4; color: var(--muted);
+  border: 1px solid var(--border); background: var(--btn-ghost-bg); color: var(--muted);
   border-radius: 20px; padding: 8px 0; font-size: 13px; width: 100%;
   margin-top: auto;
 }
-.pc-btn.primary { background: var(--dark); color: #fff; border-color: var(--dark); font-weight: 600; }
+.pc-btn.primary { background: var(--dark); color: var(--on-accent); border-color: var(--dark); font-weight: 600; }
 .pc-btn.primary:hover { opacity: .85; }
 .pc-btn:disabled { cursor: not-allowed; }
 .pc-btn.done:disabled { opacity: .75; }
 .pc-actions { display: flex; gap: 14px; font-size: 12.5px; }
-.pc-actions a { color: #4a6bdc; text-decoration: none; cursor: pointer; }
-.exec-tag { font-size: 12px; background: #f4f4f2; border-radius: 6px; padding: 2px 8px; color: #55554f; }
+.pc-actions a { color: var(--link); text-decoration: none; cursor: pointer; }
+.exec-tag { font-size: 12px; background: var(--tag-bg); border-radius: 6px; padding: 2px 8px; color: var(--tag-tx); }
 
 /* ---------- 表格 ---------- */
 .table-wrap { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; overflow-y: hidden; }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12.5px; padding: 13px 18px; border-bottom: 1px solid var(--border); background: #fafaf8; white-space: nowrap; }
-td { padding: 13px 18px; border-bottom: 1px solid #f3f3f1; }
+th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12.5px; padding: 13px 18px; border-bottom: 1px solid var(--border); background: var(--row-alt); white-space: nowrap; }
+td { padding: 13px 18px; border-bottom: 1px solid var(--row-line); }
 tr:last-child td { border-bottom: none; }
 tr.clickable { cursor: pointer; }
-tr.clickable:hover td { background: #fafaf8; }
+tr.clickable:hover td { background: var(--row-alt); }
 .amount { font-weight: 700; }
 .urgent-red { color: var(--red-tx); font-weight: 700; }
 .urgent-orange { color: var(--orange-tx); font-weight: 600; }
@@ -129,7 +177,7 @@ tr.clickable:hover td { background: #fafaf8; }
 .result-tag.ALREADY { color: var(--muted); }
 .result-tag.ERROR, .result-tag.NO_SESSION, .result-tag.NETWORK { color: var(--red-tx); }
 .result-tag.NO_AUTH { color: var(--orange-tx); }
-.table-foot { background: #fbf7e3; color: #7a6420; padding: 12px 18px; font-size: 13px; display: flex; justify-content: space-between; }
+.table-foot { background: var(--tip2-bg); color: var(--tip2-tx); padding: 12px 18px; font-size: 13px; display: flex; justify-content: space-between; }
 
 /* ---------- 日历 ---------- */
 .week-grid-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-top: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
@@ -141,26 +189,39 @@ tr.clickable:hover td { background: #fafaf8; }
 .cal-cell .d { font-size: 13px; font-weight: 700; }
 .cal-cell .p { font-size: 12px; color: var(--muted); margin-top: 6px; }
 .cal-cell .v { font-size: 20px; font-weight: 800; margin-top: 4px; }
-.cal-cell.empty { color: #c9c9c4; background: #fafaf8; border-style: dashed; }
-.cal-red { background: var(--red-bg); border-color: #f2caca; }
-.cal-red .v { color: var(--red-tx); }
-.cal-orange { background: var(--yellow-bg); border-color: #efe0ac; }
-.cal-orange .v { color: var(--orange-tx); }
-.cal-teal { background: var(--teal-bg); border-color: #bfe4da; }
-.cal-teal .v { color: var(--teal-tx); }
-.legend { display: flex; gap: 22px; margin-top: 18px; font-size: 12.5px; color: var(--muted); }
-.legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+.cal-cell.empty { color: var(--empty-tx); background: var(--row-alt); border-style: dashed; }
+/* 日历格与周卡片共用 --w1~--w4 变量，永远同色。
+   第1周→第4周对应 0-6 天 → 21-27 天到期，色相沿红→橙→黄→青递进。 */
+.cal-cell.wk { border-left-width: 1px; }
+/* 第 1 周 */
+.cal-w1 { background: var(--w1-bg); border-color: var(--w1-bd); }
+.cal-w1 .v, .cal-w1 .d { color: var(--w1-tx); }
+.cal-w1 .p { color: var(--w1-sm); }
+/* 第 2 周 */
+.cal-w2 { background: var(--w2-bg); border-color: var(--w2-bd); }
+.cal-w2 .v, .cal-w2 .d { color: var(--w2-tx); }
+.cal-w2 .p { color: var(--w2-sm); }
+/* 第 3 周 */
+.cal-w3 { background: var(--w3-bg); border-color: var(--w3-bd); }
+.cal-w3 .v, .cal-w3 .d { color: var(--w3-tx); }
+.cal-w3 .p { color: var(--w3-sm); }
+/* 第 4 周 */
+.cal-w4 { background: var(--w4-bg); border-color: var(--w4-bd); }
+.cal-w4 .v, .cal-w4 .d { color: var(--w4-tx); }
+.cal-w4 .p { color: var(--w4-sm); }
+.legend { display: flex; gap: 22px; margin-top: 18px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+.legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1px solid var(--legend-bd); }
 
 /* ---------- 平台接入页 ---------- */
 .contract-block {
-  background: #23231f; color: #e8e6df; border-radius: var(--radius);
+  background: var(--code-bg); color: var(--on-dark); border-radius: var(--radius);
   padding: 22px 26px; margin-top: 16px; font-family: Consolas, "Courier New", monospace;
   font-size: 13px; line-height: 1.85; white-space: pre-wrap;
 }
-.contract-block .cm { color: #8a8878; }
-.contract-block .kw { color: #f2c94c; }
+.contract-block .cm { color: var(--code-dim); }
+.contract-block .kw { color: var(--code-kw); }
 .check-list { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 0; }
-.check-row { display: grid; grid-template-columns: 90px 130px 1fr; align-items: center; padding: 13px 22px; border-bottom: 1px solid #f3f3f1; gap: 10px; }
+.check-row { display: grid; grid-template-columns: 90px 130px 1fr; align-items: center; padding: 13px 22px; border-bottom: 1px solid var(--row-line); gap: 10px; }
 .check-row:last-child { border-bottom: none; }
 .check-status { font-size: 12.5px; font-weight: 700; }
 .check-status.pass { color: var(--green-tx); }
@@ -175,30 +236,32 @@ tr.clickable:hover td { background: #fafaf8; }
   border: 1px solid var(--border); background: var(--card); color: var(--muted);
   border-radius: 20px; padding: 7px 16px; font-size: 13px;
 }
-.chip.active { background: var(--dark); color: #fff; border-color: var(--dark); font-weight: 600; }
+.chip.active { background: var(--dark); color: var(--on-accent); border-color: var(--dark); font-weight: 600; }
 .chip b { margin-left: 5px; }
-.chip.danger.active { background: #c0392b; border-color: #c0392b; }
+.chip.danger.active { background: var(--fail-tx); border-color: var(--fail-tx); }
+.danger-outline { color: var(--fail-tx) !important; border-color: var(--danger-bd) !important; }
+.danger-outline:hover { background: var(--red-bg); border-color: var(--fail-tx) !important; }
 .raw-block {
-  background: #23231f; color: #d8d6cd; border-radius: var(--radius);
+  background: var(--code-bg2); color: var(--code-fg2); border-radius: var(--radius);
   padding: 18px 24px; margin-top: 18px; font-family: Consolas, monospace;
   font-size: 12.5px; line-height: 1.8; white-space: pre-wrap; display: none;
 }
-.raw-block .hint { color: #f2c94c; font-size: 12.5px; margin-bottom: 10px; }
+.raw-block .hint { color: var(--code-kw); font-size: 12.5px; margin-bottom: 10px; }
 
 /* ---------- Toast / 状态 ---------- */
 .toast-wrap { position: fixed; right: 24px; top: 74px; z-index: 99; display: flex; flex-direction: column; gap: 10px; }
 .toast {
   border-radius: 12px; padding: 13px 18px; min-width: 260px; max-width: 380px;
-  background: var(--card); border: 1px solid var(--border); box-shadow: 0 6px 24px rgba(0,0,0,.09);
+  background: var(--card); border: 1px solid var(--border); box-shadow: 0 6px 24px var(--card-shadow);
   animation: slidein .2s ease; font-size: 13.5px;
 }
-.toast.ok { border-left: 4px solid #2e7d43; }
-.toast.fail { border-left: 4px solid #c0392b; }
+.toast.ok { border-left: 4px solid var(--ok-tx); }
+.toast.fail { border-left: 4px solid var(--fail-tx); }
 .toast b { display: block; margin-bottom: 3px; }
 .toast small { color: var(--muted); }
 @keyframes slidein { from { opacity: 0; transform: translateX(16px);} to { opacity: 1; } }
 
-.skeleton { border-radius: var(--radius); background: linear-gradient(100deg, #eeeeec 40%, #f6f6f4 50%, #eeeeec 60%); background-size: 200% 100%; animation: shimmer 1.2s infinite; }
+.skeleton { border-radius: var(--radius); background: linear-gradient(100deg, var(--skel-a) 40%, var(--skel-b) 50%, var(--skel-a) 60%); background-size: 200% 100%; animation: shimmer 1.2s infinite; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .empty-state {
   background: var(--card); border: 1px dashed var(--border); border-radius: var(--radius);
@@ -212,14 +275,14 @@ tr.clickable:hover td { background: #fafaf8; }
   padding: 8px 18px; font-size: 13px; font-weight: 600;
 }
 .error-banner {
-  background: var(--red-bg); border: 1px solid #f2caca; color: var(--red-tx);
+  background: var(--red-bg); border: 1px solid var(--err-bd); color: var(--red-tx);
   border-radius: 12px; padding: 14px 18px; margin: 16px 0; font-size: 13.5px;
 }
 .error-banner b { display: block; margin-bottom: 4px; }
 .error-banner small { opacity: .8; }
 
 /* ---------- 体检弹层 ---------- */
-.modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 50; display: none; align-items: center; justify-content: center; }
+.modal-mask { position: fixed; inset: 0; background: var(--mask); z-index: 50; display: none; align-items: center; justify-content: center; }
 .modal-mask.show { display: flex; }
 .modal { background: var(--card); border-radius: 16px; width: 560px; max-height: 80vh; overflow: auto; padding: 26px 28px; }
 .modal h3 { font-size: 17px; margin-bottom: 4px; }
@@ -240,3 +303,74 @@ tr.clickable:hover td { background: #fafaf8; }
 .pager-btn:hover:not(:disabled) { border-color: var(--dark); }
 .pager-btn:disabled { opacity: .4; cursor: not-allowed; }
 .pager-info { font-size: 12.5px; color: var(--muted); }
+
+/* ============================================================
+   暗色模式
+   色板全部走上面 :root 的变量，这里只做整体翻转 + 彩色卡降亮度，
+   不新增任何 :root 之外的硬编码色值（切主题时只换变量，不改规则）。
+   ============================================================ */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #131315;
+  --card: #1c1c1f;
+  --border: #2e2e33;
+  --text: #e6e6e1;
+  --muted: #909096;
+  --dark: #e8e8e3;          /* 反转：主按钮在暗色下变成浅底深字 */
+  --on-accent: #17171a;     /* 浅底上的文字取深色 */
+
+  --green-bg: #16301f; --green-tx: #6cc98d;
+  --yellow-bg: #322a12; --yellow-tx: #e0bf5a;
+  --red-bg: #33191a; --red-tx: #e88a80;
+  --orange-bg: #33240f; --orange-tx: #e5a866;
+  --teal-bg: #12302b; --teal-tx: #5fc3a8;
+  --pink-bg: #331c28; --pink-tx: #e393b5;
+
+  /* 日历 4 档：色相顺序不变（红→橙→黄→青），只压暗底色、提亮文字 */
+  --w1-bg: #3a1c1a; --w1-tx: #f0a196; --w1-bd: #5a2b26; --w1-sm: #d98a80;
+  --w2-bg: #36240f; --w2-tx: #efb474; --w2-bd: #553a1b; --w2-sm: #d99a5c;
+  --w3-bg: #332d12; --w3-tx: #e5cb6b; --w3-bd: #4d441b; --w3-sm: #cdb45f;
+  --w4-bg: #12302a; --w4-tx: #6ccdb1; --w4-bd: #1d4a40; --w4-sm: #5ebaa0;
+
+  --head-bg: rgba(19,19,21,.88);
+  --link: #7f9cf0;
+  --tip-bg: #2a2712; --tip-bd: #423c1a; --tip-tx: #ddd08a;
+  --tip2-bg: #2a2712; --tip2-tx: #ddd08a;
+  --sy-bg: #322a12; --sy-tx: #e0bf5a;
+  --sp-bg: #331c28; --sp-tx: #e393b5;
+  --so-bg: #33240f; --so-tx: #e5a866;
+  --st-bg: #12302b; --st-tx: #5fc3a8;
+  --gray-bg: #26262a; --gray-tx: #9a9a9f;
+  --badge-gray-bg: #26262a;
+  --btn-ghost-bg: #232327;
+  --tag-bg: #26262a; --tag-tx: #b4b4b9;
+  --row-alt: #202024;
+  --row-line: #2a2a2f;
+  --empty-tx: #7c7c86;
+  --legend-bd: #3a3a40;
+  --code-bg: #0e0e10; --on-dark: #d6d6cf;
+  --code-dim: #77766c;
+  --code-kw: #d9bd52;
+  --code-bg2: #0e0e10; --code-fg2: #c8c8c1;
+  --ok-tx: #6cc98d; --fail-tx: #e0705f;
+  --fail-bd: #5a2b26; --danger-bd: #5a2b26; --err-bd: #5a2b26;
+  --skel-a: #1e1e22; --skel-b: #2a2a30;
+  --card-shadow: rgba(0,0,0,.5);
+  --card-line: rgba(255,255,255,.06);
+  --mask: rgba(0,0,0,.6);
+}
+
+/* 主题切换按钮：图标随当前主题变化 */
+.theme-toggle {
+  width: 34px; height: 34px; border-radius: 10px; flex: 0 0 auto;
+  border: 1px solid var(--border); background: transparent; color: var(--text);
+  font-size: 15px; line-height: 1; display: flex; align-items: center; justify-content: center;
+  padding: 0; transition: background .15s, border-color .15s;
+}
+.theme-toggle:hover { background: var(--btn-ghost-bg); border-color: var(--muted); }
+
+/* 暗色下描边类按钮用纯白文字：正文色 #e6e6e1 在深卡底上只有 13.6:1，
+   纯白可到 17:1，与浅色下的水平（21:1）差距明显收窄。 */
+:root[data-theme="dark"] .btn-outline,
+:root[data-theme="dark"] .pager-btn,
+:root[data-theme="dark"] .chip:not(.active) { color: #fbfbfa; }

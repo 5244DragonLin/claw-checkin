@@ -21,12 +21,15 @@
       "report": "...",
       "today_credit": 0,          # 本脚本不产生签到积分，恒 0
       "streak_days": 0,
-      "total_credits": <当前剩余额度(权益赠送包, 向上取整; 体验版周期额度不计入)>,
+      "total_credits": <当前可用额度 = 权益赠送包剩余 + 体验版周期剩余, 向上取整>,
       "expiring": [ { "date": "2026-10-08", "amount": 100, "source": "CodeBuddy个人版国内运营裂变包" } ]
     }
 
 说明：
-    - 体验版（CapacityType=4）是周期额度重置而非积分作废，不计入 expiring，仅在 report 中提示。
+    - 「累计积分」= 真正能用的额度，故体验版（CapacityType=4）周期剩余也计入 total_credits：
+      日常消耗优先扣赠送包，赠送包用尽后才动用这每月 500，因此它是一份真实的可用余额。
+    - 体验版是「按月重置」而非「到期作废」，故不计入 expiring（进不了过期日历），
+      只在 report 中提示当月剩余与重置日。
     - 已用尽的包（剩余 0）不计入 expiring。
 """
 
@@ -41,6 +44,9 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import date, datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _wbsync  # noqa: E402  同目录共享模块：WorkBuddy 凭据跨机同步镜像
 
 API_URL = "https://copilot.tencent.com/billing/meter/get-user-resource"
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -239,15 +245,14 @@ def run_auth_helper(exe, request):
 
 
 def load_login():
-    """读取本机 WorkBuddy 登录态文件，返回 (token_path, token, uid, err)。"""
-    local = os.environ.get("LOCALAPPDATA") or ""
-    path = os.path.join(local, "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info")
-    if not os.path.isfile(path):
-        return None, None, None, "NO_SESSION_FILE"
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-    except (OSError, ValueError):
+    """读取 WorkBuddy 登录态，返回 (token_path, token, uid, err)。
+
+    本机凭据与跨机同步镜像（auths/workbuddy-desktop.info，明文 token）取
+    expiresAt 较新的一份——双机轮流使用时镜像可能比本机登录态更新。
+    """
+    path, _source = _wbsync.pick()
+    d = _wbsync.load_session_file(path)
+    if d is None:
         return None, None, None, "NO_SESSION_FILE"
     token = (d.get("auth") or {}).get("accessToken")
     uid = (d.get("account") or {}).get("uid") or ""
@@ -415,6 +420,10 @@ def main():
         emit("NO_AUTH", "WorkBuddy 凭据处理失败：" + AUTH_REASONS.get(derr, derr))
         return 2
 
+    # 本机凭据解密成功：顺手把明文会话同步进跨机镜像（能解密的一侧负责产出，
+    # 另一台电脑不登录客户端也能用；path 为镜像自身时自动跳过）
+    _wbsync.maybe_sync_mirror(_path, tok)
+
     accounts, ferr = fetch_user_resource(tok, uid)
     if ferr:
         if ferr == "AUTH_REJECTED":
@@ -428,20 +437,18 @@ def main():
         return 2
 
     expiring, summary = build_expiring(accounts)
-    # 账户总积分仅统计权益赠送包；体验版为周期重置额度（非持有积分），不计入
-    grand = summary["gift_remain"]
-    report = (
-        f"WorkBuddy 积分检查完成：权益赠送包剩余 {math.ceil(summary['gift_remain'])} / "
-        f"{math.ceil(summary['gift_size'])} 分"
-    )
+    # 累计积分 = 可用额度：赠送包剩余 + 体验版本周期剩余。
+    # 日常消耗优先扣赠送包，赠送包用尽才动用每月 500 体验额度，故体验版
+    # 是一份真实可用余额，须计入（此前只算赠送包，少报500）。
+    grand = summary["gift_remain"] + summary["trial_remain"]
+    report = f"WorkBuddy 可用 {math.ceil(grand)} 分"
     if summary["expiring_count"]:
-        report += (f"，其中 {summary['expiring_count']} 个包将在未来到期 "
-                   f"（合计 {summary['expiring_total']} 分，最早 {expiring[0]['date']}）")
+        report += f"，{summary['expiring_count']} 笔到期（最早 {expiring[0]['date']}）"
     else:
         report += "，近期无到期权益包"
     if summary["trial_remain"] > 0:
-        report += (f"；体验版剩余 {math.ceil(summary['trial_remain'])} 分"
-                   + (f"（{summary['trial_end']} 周期重置，不计入过期）" if summary["trial_end"] else ""))
+        report += (f"；含体验版本月 {math.ceil(summary['trial_remain'])} 分"
+                   + (f"（{summary['trial_end']} 重置）" if summary["trial_end"] else ""))
     emit("ALREADY", report, total_credits=int(math.ceil(grand)), expiring=expiring)
     return 0
 

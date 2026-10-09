@@ -5,10 +5,10 @@
 并把各笔积分的到期时间写入过期日历。
 
 凭证：auths/autoclaw.json（兼容旧名 autoclaw-cn.json）；
-token 自动提取（优先级）：
+jwt 自动提取（优先级）：
   1. AutoClaw 2 桌面端：解密 %APPDATA%/AutoClaw-official 的加密凭据库
      （Chromium os_crypt：DPAPI 保护的 AES-256-GCM，仅 Windows，需 cryptography 包）；
-     token 过期且客户端未运行时，自动用 refreshToken 调官方 /userapi/v1/agent-refresh
+     jwt 过期且客户端未运行时，自动用 refreshToken 调官方 /userapi/v1/agent-refresh
      续期并写回凭据库——完全无需打开客户端
   2. 旧版 / OpenClaw：~/.openclaw-autoclaw/openclaw.json 中的有效 JWT
 
@@ -37,8 +37,10 @@ import urllib.error
 import urllib.request
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _autoclaw_credsync as credsync  # noqa: E402  同目录共享模块：跨机会话漫游镜像
+
 APP_ID = "100003"
-APP_SECRET = "38d2391985e2369a5fb8227d8e6cd5e5"
 CLIENT_VER = "1.18.5"
 TASK_ID = "daily_signin"
 USERAPI_BASE = {
@@ -56,6 +58,15 @@ REQUEST_TIMEOUT = 20
 # 自动探测 ClawCheckin 项目根下的 auths/ 目录，也支持环境变量覆盖
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_AUTH_DIR = os.environ.get("AUTOCLAW_AUTH_DIR") or os.path.join(PROJECT_ROOT, "auths")
+# 签名盐值：原为仓库内硬编码，现从环境变量 AUTOCLAW_SIGN_SALT 读取；
+# 未设置时回退 auths/autoclaw_sign_salt.txt（本地文件，已在 .gitignore 的 auths/ 内）
+SIGN_SALT = os.environ.get("AUTOCLAW_SIGN_SALT") or ""
+if not SIGN_SALT:
+    try:
+        with open(os.path.join(DEFAULT_AUTH_DIR, "autoclaw_sign_salt.txt"), encoding="utf-8") as _f:
+            SIGN_SALT = _f.read().strip()
+    except OSError:
+        SIGN_SALT = ""
 STATE_FILE = os.path.join(PROJECT_ROOT, "data", "autoclaw_state.json")
 # AutoClaw 2 桌面端（Electron）的凭据库与刷新端点（release/cn 环境）
 AUTOCCLAW2_DIR = os.path.join(os.environ.get("APPDATA", ""), "AutoClaw-official")
@@ -67,15 +78,15 @@ OPENCLAW_RUNTIME = os.path.join(os.path.expanduser("~"), ".openclaw-autoclaw", "
 
 
 def _sign(ts: str) -> str:
-    return hashlib.md5(f"{APP_ID}&{ts}&{APP_SECRET}".encode()).hexdigest()
+    return hashlib.md5(f"{APP_ID}&{ts}&{SIGN_SALT}".encode()).hexdigest()
 
 
-def _bearer(token: str) -> str:
-    t = token.strip()
+def _bearer(jwt: str) -> str:
+    t = jwt.strip()
     return t if t.lower().startswith("bearer ") else "Bearer " + t
 
 
-def _build_headers(token: str) -> dict:
+def _build_headers(jwt: str) -> dict:
     ts = str(int(time.time()))
     return {
         "Content-Type": "application/json",
@@ -90,7 +101,7 @@ def _build_headers(token: str) -> dict:
         "X-Auth-Sign": _sign(ts),
         "X-Trace-Id": str(uuid.uuid4()),
         "X-Lang": "en",
-        "Authorization": _bearer(token),
+        "Authorization": _bearer(jwt),
         "User-Agent": f"AutoClaw/{CLIENT_VER}",
     }
 
@@ -106,13 +117,13 @@ def _load_auth(auth_dir: str) -> dict | None:
                 doc = json.load(f)
         except Exception:
             continue
-        token = (doc.get("accessToken") or "").strip()
-        if not token:
+        jwt = (doc.get("accessToken") or "").strip()
+        if not jwt:
             continue
         return {
             "path": path,
             "region": doc.get("region") or "cn",
-            "token": token,
+            "jwt": jwt,
         }
     return None
 
@@ -131,25 +142,25 @@ def _refresh_from_openclaw(auth_dir: str) -> bool:
         best = None
         for m in zai.get("models", []):
             auth = m.get("headers", {}).get("X-Authorization", "")
-            token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
-            if not token or not token.startswith("ey") or token.count(".") != 2:
+            jwt = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+            if not jwt or not jwt.startswith("ey") or jwt.count(".") != 2:
                 continue
             try:
-                payload_b64 = token.split(".")[1]
+                payload_b64 = jwt.split(".")[1]
                 payload_b64 += "=" * (-len(payload_b64) % 4)
                 payload = json.loads(__import__("base64").urlsafe_b64decode(
                     payload_b64.replace("-", "+").replace("_", "/")))
                 exp = payload.get("exp", 0)
                 if exp > __import__("time").time() + 300:
                     if best is None or exp > best["exp"]:
-                        best = {"token": token, "exp": exp}
+                        best = {"jwt": jwt, "exp": exp}
             except Exception:
                 continue
         if best:
             os.makedirs(auth_dir, exist_ok=True)
             dst = os.path.join(auth_dir, "autoclaw.json")
             doc = {
-                "accessToken": "Bearer " + best["token"],
+                "accessToken": "Bearer " + best["jwt"],
                 "region": "cn",
                 "userId": "from-openclaw",
                 "userName": "openclaw-auto",
@@ -160,10 +171,10 @@ def _refresh_from_openclaw(auth_dir: str) -> bool:
     return False
 
 
-def _jwt_exp(token: str) -> float:
+def _jwt_exp(jwt: str) -> float:
     """解析 JWT 的 exp（秒），失败返回 0。"""
     try:
-        seg = token.split(".")[1]
+        seg = jwt.split(".")[1]
         payload = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
         return float(payload.get("exp", 0))
     except Exception:
@@ -260,8 +271,11 @@ def _autoclaw2_running() -> bool:
     客户端下次刷新失败而要求重新登录，故运行期间不碰凭据库）。"""
     try:
         for name in AUTOCCLAW2_PROCESSES:
+            # 中文 Windows 的 tasklist 输出是 GBK：不指定解码会让读取线程崩掉、
+            # stdout 变空，客户端运行中会被误判为未运行而误写凭据库
             out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}"],
-                                 capture_output=True, text=True).stdout or ""
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace").stdout or ""
             if name.lower() in out.lower():
                 return True
     except Exception:
@@ -304,8 +318,8 @@ def _autoclaw2_remote_refresh(refresh_token: str, device_id: str, old_access: st
         return None
     refresh = str(data.get("refresh_token") or "").strip() or refresh_token
 
-    def norm(token: str) -> str:
-        return token if token[:7].lower() == "bearer " else "Bearer " + token
+    def norm(jwt: str) -> str:
+        return jwt if jwt[:7].lower() == "bearer " else "Bearer " + jwt
 
     return {"access": norm(access), "refresh": norm(refresh) if refresh else old_access}
 
@@ -338,7 +352,7 @@ def _upsert_autoclaw_auth(auth_dir: str, access: str, exp: float) -> bool:
     if exp <= time.time() + 300:
         return False
     current = _load_auth(auth_dir)
-    if current and _jwt_exp(current["token"].replace("Bearer ", "").strip()) >= exp - 60:
+    if current and _jwt_exp(current["jwt"].replace("Bearer ", "").strip()) >= exp - 60:
         return False
     os.makedirs(auth_dir, exist_ok=True)
     with open(os.path.join(auth_dir, "autoclaw.json"), "w", encoding="utf-8") as f:
@@ -349,27 +363,37 @@ def _upsert_autoclaw_auth(auth_dir: str, access: str, exp: float) -> bool:
 
 
 def _refresh_from_autoclaw2(auth_dir: str) -> bool:
-    """AutoClaw 2 凭据自动就绪：token 有效直接采用；过期且客户端未运行时
-    用 refreshToken 自主续期并写回凭据库——签到无需客户端参与。"""
+    """AutoClaw 2 凭据自动就绪：本地凭据库优先（jwt 有效直接采用；过期且
+    客户端未运行时用 refreshToken 自主续期并写回凭据库），走不通时退回跨机
+    会话镜像 auths/autoclaw_sync.json（同步盘双机轮流使用，见 _autoclaw_credsync）。
+    """
     vault = _read_autoclaw2_vault()
-    if not vault:
-        return False
-    if vault["exp"] > time.time() + 300:
-        return _upsert_autoclaw_auth(auth_dir, vault["access"], vault["exp"])
-    if _autoclaw2_running():
-        return False  # 客户端运行中会自行轮换，不并发写凭据库
-    renewed = _autoclaw2_remote_refresh(vault["refresh"], _autoclaw2_device_id(), vault["access"])
-    if not renewed:
-        return False
-    _write_autoclaw2_vault(vault, renewed["access"], renewed["refresh"])
-    return _upsert_autoclaw_auth(auth_dir, renewed["access"],
-                                 _jwt_exp(renewed["access"].split(" ", 1)[-1]))
+    device_id = _autoclaw2_device_id()
+    if vault:
+        credsync.note(vault["access"], vault["refresh"], vault["exp"], device_id)
+        if vault["exp"] > time.time() + 300:
+            return _upsert_autoclaw_auth(auth_dir, vault["access"], vault["exp"])
+        if not _autoclaw2_running():
+            renewed = _autoclaw2_remote_refresh(vault["refresh"], device_id, vault["access"])
+            if renewed:
+                _write_autoclaw2_vault(vault, renewed["access"], renewed["refresh"])
+                credsync.note(renewed["access"], renewed["refresh"],
+                              _jwt_exp(renewed["access"].split(" ", 1)[-1]), device_id)
+                return _upsert_autoclaw_auth(auth_dir, renewed["access"],
+                                             _jwt_exp(renewed["access"].split(" ", 1)[-1]))
+    return credsync.fallback_refresh(
+        auth_dir,
+        upsert=_upsert_autoclaw_auth,
+        remote_refresh=_autoclaw2_remote_refresh,
+        jwt_exp=_jwt_exp,
+        vault=vault, vault_writer=_write_autoclaw2_vault,
+        client_running=_autoclaw2_running)
 
 
-def _http_json(method: str, url: str, token: str, body: dict | None) -> tuple:
+def _http_json(method: str, url: str, jwt: str, body: dict | None) -> tuple:
     """发起 HTTP 请求，返回 (parsed_json_or_None, status_code, error_msg)。"""
     data = None
-    headers = _build_headers(token)
+    headers = _build_headers(jwt)
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -396,7 +420,7 @@ def _wallet_balance(acct: dict) -> int | None:
     """查询官方钱包总积分（total_balance），与 AutoClaw 客户端积分页同源。"""
     base = USERAPI_BASE.get(acct["region"], USERAPI_BASE["cn"])
     url = f"{base}{PATH_WALLETS}?biz_app_id=autoclaw"
-    payload, status, err = _http_json("GET", url, acct["token"], None)
+    payload, status, err = _http_json("GET", url, acct["jwt"], None)
     if payload is None or not isinstance(payload, dict):
         return None
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -427,7 +451,7 @@ def _wallet_expiring(acct: dict) -> list:
     """
     base = USERAPI_BASE.get(acct["region"], USERAPI_BASE["cn"])
     url = f"{base}{PATH_WALLET_INSTANCES}?wallet_type=all&wallet_scope=all"
-    payload, status, err = _http_json("GET", url, acct["token"], None)
+    payload, status, err = _http_json("GET", url, acct["jwt"], None)
     if payload is None or not isinstance(payload, dict):
         return []
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -445,8 +469,21 @@ def _wallet_expiring(acct: dict) -> list:
         if amount <= 0:
             continue
         exp = str(inst.get("expires_at") or "")
-        exp_date = exp[:10] if len(exp) >= 10 else ""
-        if not exp_date or exp_date < today:
+        if len(exp) < 10:
+            continue
+        # 上游把「某日 24:00 失效」记为「次日 00:00:00」（如 2026-10-10T00:00:00
+        # 实际是 10-09 24 点失效）：时间部分恰为 00:00:00 的实例归入前一日，
+        # 否则到期日整体偏移一天，跨零点的行还会以「未来行」身份滞留日历
+        if exp[10:19] == "T00:00:00":
+            try:
+                exp_date = time.strftime(
+                    "%Y-%m-%d",
+                    time.localtime(time.mktime(time.strptime(exp[:10], "%Y-%m-%d")) - 86400))
+            except ValueError:
+                exp_date = exp[:10]
+        else:
+            exp_date = exp[:10]
+        if exp_date < today:
             continue
         expiring.append({
             "date": exp_date,
@@ -459,7 +496,7 @@ def _wallet_expiring(acct: dict) -> list:
 
 def main():
     auth_dir = DEFAULT_AUTH_DIR
-    # 自动从桌面端凭据库刷新 token（AutoClaw 2 优先，失败退回旧版 openclaw.json）
+    # 自动从桌面端凭据库刷新 jwt（AutoClaw 2 优先，失败退回旧版 openclaw.json）
     _refresh_from_openclaw(auth_dir)
     _refresh_from_autoclaw2(auth_dir)
     acct = _load_auth(auth_dir)
@@ -481,10 +518,10 @@ def main():
         return 1
 
     expiring = _wallet_expiring(acct)
-    report = f"权威余额 {total} 积分"
+    report = f"AutoClaw 余额 {total} 分"
     if expiring:
         exp_total = sum(e["amount"] for e in expiring)
-        report += f"，{len(expiring)} 笔共 {exp_total} 分将在未来到期（最早 {expiring[0]['date']}）"
+        report += f"，{len(expiring)} 笔到期（最早 {expiring[0]['date']}）"
     print(json.dumps({
         "result": "ALREADY",
         "report": report,

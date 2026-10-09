@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -42,9 +43,9 @@ def _load_config_with_env() -> AppConfig:
     return cfg
 
 
-def create_app(config: AppConfig | None = None) -> FastAPI:
+def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) -> FastAPI:
     cfg = config or _load_config_with_env()
-    ledger = Ledger(cfg.db_path)
+    ledger = ledger or Ledger(cfg.db_path)
     ledger.cleanup(cfg.ledger.retention_days,
                    cfg.ledger.snapshot_retention_days)
 
@@ -52,26 +53,95 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         "health": {},       # platform → 体检结果
     }
 
-    def _startup_credit_refresh():
-        """启动时后台补跑隐藏积分源（纯查询、不签到），打开面板即见最新余额。"""
-        def _job():
+    # 积分源刷新串行化：HTTP 请求、启动线程、周期线程、签到补跑都汇到这里。
+    # 周期/页面加载竞争时直接跳过而不是排队——脚本跑一次只需几秒，跳过方下次
+    # 轮询/页面刷新自然拿到新值，也避免并发跑同一批脚本（小浣熊发放链路对
+    # 并发敏感）；签到后的补跑属「拿到最新余额」的关键路径，改为排队等待
+    _refresh_lock = threading.Lock()
+    _last_refresh = [0.0]        # 上次实际跑脚本的时刻（monotonic），页面加载防抖用
+
+    def _refresh_credits_once(trigger: str) -> list[dict] | None:
+        """补跑全部隐藏积分源（纯查询、不签到），返回每个积分源的结果。
+
+        返回 None 表示本次被跳过（已有刷新在跑，或页面加载防抖窗口内），
+        与「没有积分源脚本」的空列表区分——前端据此决定要不要重拉数据。
+        刷新只在「有变化」时写入账本（结果状态翻转 / 余额变化 / 临期集合变化）：
+        周期刷新若每次都落盘，账本单文件会被高频重写，同步盘流量也扛不住。
+        """
+        if not _refresh_lock.acquire(blocking=False):
+            return None
+        try:
+            now = time.monotonic()
+            if (trigger == "page_load"
+                    and now - _last_refresh[0] < cfg.credits.page_load_debounce):
+                return None      # 浏览器 F5 连点：防抖窗口内不重复跑脚本
+            _last_refresh[0] = now
+            results = []
+            latest = ledger.latest_per_platform()
+            snap_now: dict[str, list] = {}
+            # 用实时口径（今天及以后 + 接口仍持有）比对：失效行不算变化，
+            # 否则每次刷新都会因「历史行集合」差异反复落盘
+            for e in ledger.expiring_snapshots(live_only=True):
+                snap_now.setdefault(e["platform"], []).append(
+                    (e["date"], e["amount"], e["source"]))
             for s in scan_scripts(cfg.scripts_path):
                 if not (s.hidden and s.name.endswith("_credits")):
                     continue
                 try:
                     rr = run_script(s.name, s.path, build_command(s), cfg.scripts.timeout)
-                    ledger.insert_run(rr, trigger="refresh")
-                    log.info("启动积分刷新 %s → %s", s.name, rr.result)
-                except Exception:
-                    log.exception("启动积分刷新失败：%s", s.name)
-        threading.Thread(target=_job, daemon=True, name="credit-refresh").start()
+                    exp_new = sorted((str(e.get("date", "")), int(e.get("amount", 0)),
+                                      str(e.get("source", ""))) for e in rr.expiring)
+                    prev = latest.get(s.name)
+                    changed = (prev is None
+                               or rr.result != prev["result"]
+                               or rr.total_credits != prev["total_credits"]
+                               or exp_new != sorted(snap_now.get(s.name, [])))
+                    if changed:
+                        ledger.insert_run(rr, trigger=trigger)
+                        log.info("积分刷新(%s) %s → %s", trigger, s.name, rr.result)
+                    results.append({"platform": s.name, "result": rr.result,
+                                    "report": rr.report, "ok": rr.ok})
+                except Exception as e:
+                    log.exception("积分刷新(%s)失败：%s", trigger, s.name)
+                    results.append({"platform": s.name, "result": "ERROR",
+                                    "report": str(e), "ok": False})
+            return results
+        finally:
+            _refresh_lock.release()
+
+    class _CreditRefresher:
+        """按固定间隔后台刷新积分余额（消耗积分后无需重启面板即可见最新值）。"""
+
+        def __init__(self, interval: int):
+            self.interval = max(0, int(interval))
+            self._stop = threading.Event()
+
+        def start(self):
+            if self.interval <= 0:
+                log.info("积分余额自动刷新未启用（credits.refresh_interval=0）")
+                return
+            def _loop():
+                while not self._stop.wait(self.interval):
+                    try:
+                        _refresh_credits_once("refresh")
+                    except Exception:
+                        log.exception("积分余额周期刷新失败")
+            threading.Thread(target=_loop, daemon=True,
+                             name="credit-refresh-loop").start()
+
+        def stop(self):
+            self._stop.set()
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
-        _startup_credit_refresh()
+        threading.Thread(target=_refresh_credits_once, args=("refresh",),
+                         daemon=True, name="credit-refresh").start()
+        refresher = _CreditRefresher(cfg.credits.refresh_interval)
+        refresher.start()
         scheduler = DailyScheduler(cfg, ledger, state)
         scheduler.start()
         yield
+        refresher.stop()
         scheduler.stop()
 
     app = FastAPI(title="ClawCheckin · 龙虾签到台", version="1.0.0", lifespan=_lifespan)
@@ -95,15 +165,27 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 and s.name.removesuffix("_credits") == name]
 
     def _run_credit_sources(name: str, trigger: str = "manual") -> list:
-        """补跑隐藏积分源：签到脚本回报的口径有时不是面板要的「总积分」。"""
+        """补跑隐藏积分源：签到脚本回报的口径有时不是面板要的「总积分」。
+
+        与积分刷新共用一把锁：签到刚入账，这里必须等到在跑的刷新结束再查询，
+        才能拿到本次签到后的最新余额（排队最多等一个脚本超时，等不到就跳过，
+        交给周期刷新兜底）。
+        """
         out = []
         for cs in _credit_sources_for(name):
+            if not _refresh_lock.acquire(timeout=cfg.scripts.timeout):
+                out.append({"platform": cs.name, "source_for": name, "ok": True,
+                            "result": "SKIP", "total_credits": None,
+                            "report": "已有积分刷新在跑，本轮跳过（周期刷新会补上）"})
+                continue
             try:
                 rr = _run_one(cs, trigger=trigger)
             except Exception as e:      # 积分源失败不影响签到结果本身
                 out.append({"platform": cs.name, "source_for": name, "ok": False,
                             "result": "ERROR", "total_credits": None, "report": str(e)})
                 continue
+            finally:
+                _refresh_lock.release()
             out.append({"platform": cs.name, "source_for": name, "ok": rr.ok,
                         "result": rr.result, "total_credits": rr.total_credits,
                         "report": rr.report})
@@ -125,8 +207,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         state["health"][info.name] = h
         return h
 
-    def _expiring_rows():
-        return ledger.expiring_snapshots()
+    def _expiring_rows(live_only: bool = True):
+        """临期快照。live_only=True 只给「今天及以后、接口仍持有」的行——日历与
+        总览用它，保证当日格子的数字与平台客户端实时一致；void30 用False 取全量。"""
+        return ledger.expiring_snapshots(live_only=live_only)
 
     def _expiring_for(name: str) -> list:
         """某可见平台的 expiring 记录：按归属组聚合（平台与隐藏积分源同组）。"""
@@ -174,8 +258,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             # 今日已签：今天有该平台的成功记录
             today_ok = bool(row and row["ts"].startswith(today)
                             and row["result"] in ("CLAIMED", "ALREADY"))
-            credits = (credit_source.get(s.name, row["total_credits"])
-                       if row and row["total_credits"] is not None else 0)
+            # 积分源余额优先；无积分源时回退签到脚本自己的 total_credits；
+            # 两者都没有（如刚清空日志但积分源已刷新）才置 0
+            if s.name in credit_source:
+                credits = credit_source[s.name]
+            elif row and row["total_credits"] is not None:
+                credits = row["total_credits"]
+            else:
+                credits = 0
             streak = row["streak_days"] if row and row["streak_days"] is not None else 0
             total_credits += credits
             max_streak = max(max_streak, streak)
@@ -185,7 +275,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 e["amount"] for e in exp_rows
                 if today <= e["date"] <= limit_day
             )
-            has_expiring = bool(exp_rows)
+            # 过期历史行也常驻快照，「即将过期」只看今天及以后
+            has_expiring = any(e["date"] >= today for e in exp_rows)
             # 最早到期只看未过期记录：快照可能残留过去日期，不能当作「即将到期」提示
             earliest_expiring = min((e["date"] for e in exp_rows if e["date"] >= today), default="")
             platforms.append({
@@ -200,8 +291,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 "has_expiring": has_expiring,
                 "earliest_expiring": earliest_expiring,
             })
-        # covered 基于可见平台的 expiring 归属（隐藏 *_credits 合并到对应平台）
-        covered = sum(1 for s in scripts if _expiring_for(s.name))
+        # covered 基于可见平台的 expiring 归属（隐藏 *_credits 合并到对应平台）；
+        # 只看今天及以后的行——过期历史行不代表平台仍在提供临期数据
+        covered = sum(
+            1 for s in scripts
+            if any(e["date"] >= today for e in _expiring_for(s.name))
+        )
 
         # 14 天临期明细（按归属组去重：平台与其积分源只算一次）
         expiring_detail = []
@@ -307,9 +402,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         today = datetime.now()
         days = []
         exp_map: dict[str, list] = {}
+        visible_names = {s.name for s in _visible()}
         for e in _expiring_rows():
             group = _expiry_group(e["platform"])
-            if group not in {s.name for s in _visible()}:
+            if group not in visible_names:
                 continue
             exp_map.setdefault(e["date"], []).append(
                 {"platform": _credit_display(e["platform"]), "amount": e["amount"], "source": e["source"] or "签到奖励"}
@@ -328,9 +424,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 "amount": amount,
                 "items": items,
             })
-        # 过去 30 天已作废
+        # 过去 30 天已作废（与未来日历分开：这里取全量，含已被接口移除的历史行）
         cutoff = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-        for e in _expiring_rows():
+        for e in _expiring_rows(live_only=False):
+            if _expiry_group(e["platform"]) not in visible_names:
+                continue
             if cutoff <= e["date"] < today.strftime("%Y-%m-%d"):
                 void30 += e["amount"]
         return {
@@ -352,6 +450,28 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=claw-checkin_logs.csv"},
         )
+
+    @app.post("/api/logs/clear")
+    def api_logs_clear():
+        """清空运行日志（仅 checkin_log 表；过期日历快照不受影响）。"""
+        deleted = ledger.clear_logs()
+        log.info("运行日志已清空，共删除 %s 条", deleted)
+        return {"ok": True, "deleted": deleted}
+
+    @app.post("/api/refresh_credits")
+    def api_refresh_credits(source: str = "button"):
+        """补跑全部积分源（纯查询、不签到），刷新卡片上的积分余额。
+
+        source=page_load：前端整页加载时自动触发，防抖窗口内（以及已有刷新
+        在跑时）跳过并如实告知，前端保持当前数据、交给轮询兜底；
+        source=button（右上角按钮）：用户显式动作，只做并发保护，不防抖。
+        """
+        trigger = "page_load" if source == "page_load" else "manual"
+        results = _refresh_credits_once(trigger)
+        if results is None:
+            return {"ran": 0, "ok": 0, "results": [], "skipped": True}
+        return {"ran": len(results), "ok": sum(1 for r in results if r["ok"]),
+                "results": results, "skipped": False}
 
     @app.post("/api/refresh/{name}")
     def api_refresh(name: str):

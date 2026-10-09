@@ -30,8 +30,14 @@ class ScheduleConfig:
 
 
 @dataclass
+class CreditsConfig:
+    refresh_interval: int = 300   # 积分余额自动刷新间隔（秒），0 关闭；仅补跑隐藏 *_credits 积分源
+    page_load_debounce: int = 30  # 页面加载触发刷新的防抖窗口（秒），防 F5 连点；0 关闭防抖
+
+
+@dataclass
 class LedgerConfig:
-    db: str = "data/ledger.db"    # SQLite 账本路径
+    db: str = "data/ledger.json"  # 账本（单文件 JSON，同步盘友好；旧 .db 配置自动兼容）
     retention_days: int = 90      # 日志本地保留天数
     snapshot_retention_days: int = 31  # 临期积分快照保留天数
 
@@ -47,6 +53,7 @@ class AppConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     scripts: ScriptsConfig = field(default_factory=ScriptsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    credits: CreditsConfig = field(default_factory=CreditsConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -65,7 +72,8 @@ _DEFAULTS = {
     "server": {"host": "127.0.0.1", "port": 8317},
     "scripts": {"dir": "scripts", "timeout": 120},
     "schedule": {"enabled": True, "time": "00:05"},
-    "ledger": {"db": "data/ledger.db", "retention_days": 90,
+    "credits": {"refresh_interval": 300, "page_load_debounce": 30},
+    "ledger": {"db": "data/ledger.json", "retention_days": 90,
                "snapshot_retention_days": 31},
     "logging": {"level": "INFO", "file": ""},
 }

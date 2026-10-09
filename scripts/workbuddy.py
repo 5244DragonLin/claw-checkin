@@ -28,7 +28,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _wbsync  # noqa: E402  同目录共享模块：WorkBuddy 凭据跨机同步镜像
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SIGNIN_CANDIDATES = [
@@ -41,9 +44,6 @@ SIGNIN_CANDIDATES = [
 ]
 
 SIGNIN_TIMEOUT = 120  # 签到 + 成长中心预算
-
-# WorkBuddy 桌面端登录凭据路径（与 signin.py 保持一致）
-AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info")
 
 
 def _find_signin() -> str | None:
@@ -61,53 +61,43 @@ def _find_signin() -> str | None:
     return None
 
 
-def _probe_auth_file() -> tuple[str | None, list[str]]:
-    """探测 WorkBuddy 登录凭据文件，支持 WORKBUDDY_AUTH_FILE 覆盖。"""
-    override = os.environ.get("WORKBUDDY_AUTH_FILE")
-    if override:
-        return (override if os.path.isfile(override) else None), [override]
-    home = os.path.expanduser("~")
-    local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
-    candidates = [
-        os.path.join(local, AUTH_BASENAME),
-        os.path.join(home, ".workbuddy", "auth", "workbuddy-desktop.info"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c, candidates
-    return None, candidates
-
-
 def _refresh_check() -> dict:
-    """纯凭证刷新：只校验本地凭据是否存在且含有效 accessToken，不执行签到。"""
-    auth_file, _looked = _probe_auth_file()
-    if not auth_file:
+    """纯凭证刷新：校验本地/同步镜像凭据是否就绪，不执行签到。"""
+    path, source = _wbsync.pick()
+    where = {"local": "本机凭据", "mirror": "同步镜像凭据（auths/）", "none": ""}[source]
+    if not path:
         return {
             "result": "NO_AUTH",
-            "report": "未找到 WorkBuddy 登录凭据，请先登录 WorkBuddy 桌面端",
+            "report": "未找到 WorkBuddy 登录凭据（本机与同步镜像均无），请先登录 WorkBuddy 桌面端",
             "today_credit": 0, "streak_days": 0, "total_credits": 0,
         }
-    try:
-        with open(auth_file, encoding="utf-8") as f:
-            session = json.load(f)
-        token = (session or {}).get("auth", {}).get("accessToken")
-    except Exception:
+    session = _wbsync.load_session_file(path)
+    token = _wbsync.token_of(session)
+    if token is None:
         return {
             "result": "NO_AUTH",
-            "report": "凭据文件读取失败，请重新登录 WorkBuddy 桌面端",
+            "report": f"{where}读取失败或缺少 accessToken，请重新登录 WorkBuddy 桌面端",
             "today_credit": 0, "streak_days": 0, "total_credits": 0,
         }
-    # 新版加密信封（$wbEncrypted/sym-v1）：签到时会由 WorkBuddy.exe 运行时解密
+    exp = _wbsync.session_expiry(session)
+    if exp and exp <= time.time():
+        return {
+            "result": "NO_AUTH",
+            "report": f"{where}已过期，请重新登录 WorkBuddy 桌面端",
+            "today_credit": 0, "streak_days": 0, "total_credits": 0,
+        }
+    # 新版加密信封（$wbEncrypted/sym-v1）：签到时由本机 WorkBuddy.exe 运行时解密；
+    # 同步镜像里存的是明文 token，无需客户端参与
     if isinstance(token, dict) and token.get("$wbEncrypted") == 1:
         return {
             "result": "ALREADY",
-            "report": "Token 已就绪（新版加密凭据，签到时会自动解密）",
+            "report": f"Token 已就绪（{where}，加密信封，签到时自动解密）",
             "today_credit": 0, "streak_days": 0, "total_credits": 0,
         }
     if isinstance(token, str) and token:
         return {
             "result": "ALREADY",
-            "report": "Token 已刷新，凭据有效",
+            "report": f"Token 已刷新，凭据有效（{where}）",
             "today_credit": 0, "streak_days": 0, "total_credits": 0,
         }
     return {
@@ -167,9 +157,32 @@ def _remap(result: dict) -> dict:
 
 
 def main():
+    # WorkBuddy 可执行文件路径：写进本进程环境变量，且必须先于一切解密操作——
+    # signin.py 子进程靠它解密凭据，跨机镜像的明文提取（_wbsync）同样靠它
+    if "WORKBUDDY_EXE" not in os.environ:
+        for candidate in (
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe"),
+            r"D:\WorkBuddy\WorkBuddy.exe",
+            r"D:\Program Files\WorkBuddy\WorkBuddy.exe",
+        ):
+            if os.path.isfile(candidate):
+                os.environ["WORKBUDDY_EXE"] = candidate
+                break
+
     # --refresh：纯凭证刷新，只校验凭据不执行签到
     if "--refresh" in sys.argv:
+        # 刷新顺带把本机最新凭据同步进跨机镜像（另一台电脑不登录也能用）
+        sync_note = ""
+        signin_path = _find_signin()
+        if signin_path:
+            try:
+                if _wbsync.update_from_local(signin_path) == "synced":
+                    sync_note = "；跨机镜像已更新"
+            except Exception:
+                pass
         out = _refresh_check()
+        if sync_note:
+            out["report"] += sync_note
         print(json.dumps(out, ensure_ascii=False))
         return 0 if out["result"] == "ALREADY" else 1
 
@@ -186,17 +199,17 @@ def main():
         }, ensure_ascii=False))
         return 2
 
-    # 设置 WorkBuddy 可执行文件路径（如已安装），signin.py 靠它解密凭据
     env = os.environ.copy()
-    # 常见安装路径：用户自定义目录
-    for candidate in (
-        r"D:\WorkBuddy\WorkBuddy.exe",
-        r"D:\Program Files\WorkBuddy\WorkBuddy.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe"),
-    ):
-        if os.path.isfile(candidate) and "WORKBUDDY_EXE" not in env:
-            env["WORKBUDDY_EXE"] = candidate
-            break
+
+    # 尽力把本机最新凭据同步进跨机镜像（能解密的一侧负责产出明文镜像），
+    # 再决定 signin.py 读本地凭据还是同步镜像（双机轮流使用，见 _wbsync）
+    try:
+        _wbsync.update_from_local(signin_path)
+    except Exception:
+        pass
+    _auth_path, _auth_source = _wbsync.pick()
+    if _auth_source == "mirror":
+        env["WORKBUDDY_AUTH_FILE"] = _wbsync.MIRROR_PATH
 
     # signin.py 默认把日志写到自身同目录；重定向到项目 data/，保持 vendor/ 干净
     if "WORKBUDDY_SIGNIN_LOG" not in env:
@@ -266,9 +279,10 @@ def main():
     out["result"] = result_map.get(signin_result, signin_result if signin_result in (
         "CLAIMED", "ALREADY", "NO_SESSION", "NO_AUTH", "NETWORK", "ERROR") else "ERROR")
 
-    # 对齐 autoclaw：已签到场景精简 report、今日积分归零（避免日志看起来可重复签到）
+    # 已签到场景：保留今日积分数值（取自 signin.py 原始输出，避免显示 +0）
     if out["result"] == "ALREADY":
-        out["report"] = "今日已签到（+0 积分）"
+        actual = int(data.get("today_credit") or data.get("credit") or 0)
+        out["report"] = f"今日已签到（+{actual} 积分）"
         out["today_credit"] = 0
 
     # 成长中心信息（旅行名额/能量等）在已签到场景也保留

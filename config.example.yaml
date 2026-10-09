@@ -16,10 +16,15 @@ schedule:
   enabled: true       # 到点自动把 scripts/ 下所有平台各跑一遍
   time: "00:05"       # 触发时刻（HH:MM）；错过时刻（如关机）会在当日开机后补跑一次
 
-# 账本（SQLite）
+# 积分余额刷新（纯查询、不签到；只补跑隐藏 *_credits 积分源）
+credits:
+  refresh_interval: 300  # 自动刷新间隔（秒），默认 5 分钟；设为 0 关闭
+  page_load_debounce: 30 # 每次打开/刷新页面自动触发一次刷新，此为 F5 连点防抖窗口（秒），0 关闭
+
+# 账本（单文件 JSON，同步盘双机友好；旧 data/ledger.db 首次启动自动迁移）
 ledger:
-  db: data/ledger.db  # 签到日志与临期积分快照
-  retention_days: 90  # 日志本地保留天数，过期自动清理
+  db: data/ledger.json  # 签到日志与临期积分快照
+  retention_days: 90    # 日志本地保留天数，过期自动清理
 
 # 日志
 logging:
