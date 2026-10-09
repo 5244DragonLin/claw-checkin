@@ -96,12 +96,15 @@ def main() -> int:
                 daily_points = value
 
     # 每日积分临期：按账单 expire_at 逐笔聚合（24 小时 / 7 天自适应，见 _raccoon_expiry）
+    # daily_points 一并传入：账单记的是发放原额，直接相加会把已消耗部分也算成
+    # 即将过期（900 vs 实际剩余 867），按余额摊薄后才等于真实会到期损失的积分。
     today = time.strftime("%Y-%m-%d")
     expiring = []
     bills, _bills_status, _bills_err = rc.api_json(
         "GET", PATH_BILLS, creds["access"], timeout=30)
     if bills is not None:
-        expiring = rx.daily_expiring_from_bills(bills, today)
+        expiring = rx.daily_expiring_from_bills(
+            bills, today, daily_points if daily_points > 0 else None)
 
     # 统一格式：余额 X 分，N 笔到期（最早 YYYY-MM-DD）
     report = f"小浣熊余额 {available} 分"

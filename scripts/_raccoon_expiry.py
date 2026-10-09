@@ -66,18 +66,29 @@ def _grant_source(item: dict, date: str, today: str) -> str:
     return "每日积分（当日 24:00 清零）" if date == today else "每日积分（当天登录，7 天有效）"
 
 
-def daily_expiring_from_bills(bills, today: str) -> list[dict]:
+def daily_expiring_from_bills(bills, today: str, daily_balance=None) -> list[dict]:
     """从账单生成每日积分临期快照：按 expire_at 逐笔聚合，有效期自适应。
 
     返回契约的 expiring 数组（date/amount/source，按日期升序），只含今天及
     未来的到期日：
-      - 标签按「发放日 vs 到期日」判定（发放日 == 到期日 →「当日 24:00 清零」，
+      - 标签按「发放日 vs 到期日」判定（发放日== 到期日 →「当日 24:00 清零」，
         否则「当天登录，7 天有效」），与运行日期无关——同一笔积分从发放日到
         到期日标签不变，账本按 (date, amount, source) 去重才不会在到期日双计；
         发放日与到期日不同的笔目各自成行，同日不同模式不混算；
       - 过去日期一律不上报：已作废的历史笔目由到期当日那次运行捕获进快照，
         反复重报会重复计入作废统计；
-      - expire_at 解析失败的笔目跳过（宁缺勿错，不回退到旧的硬编码口径）。
+      - expire_at 解析失败的笔目跳过（宁缺勿错，不回退到旧的硬编码口径）；
+      - daily_balance 给定时按余额接口的 daily_points 摊薄（见摊薄说明）。
+
+    摊薄说明（2026-10-09 修正）：
+      账单里每笔 daily_grant 记的是**发放时原额**（如300×3=900），而余额接口
+      `daily_points` 是每日积分钱包的**实际剩余**（如 867）。用户消耗积分后
+      账单原额不变，直接相加会把已花掉的部分也算成「即将过期」，虚高。
+      积分池扣减不绑定具体笔目，故按到期日升序摊薄：把 daily_balance 从最早
+      到期的笔目起逐笔填满，填不满的最后一笔（最晚到期）取剩余值。这样
+      「14 天内将过期」= 真实会因到期而损失的积分，且总数恒等于 daily_points。
+
+    daily_balance 为 None 或 <= 0 时退回原额相加（老口径，仅作兜底）。
     """
     agg: dict[tuple[str, str], int] = {}
     for item in _daily_grant_items(bills):
@@ -90,8 +101,38 @@ def daily_expiring_from_bills(bills, today: str) -> list[dict]:
             continue
         key = (date, _grant_source(item, date, today))
         agg[key] = agg.get(key, 0) + points
-    return [{"date": d, "amount": pts, "source": src}
+
+    rows = [{"date": d, "amount": pts, "source": src}
             for (d, src), pts in sorted(agg.items())]
+    return _cap_to_daily_balance(rows, daily_balance)
+
+
+def _cap_to_daily_balance(rows: list[dict], daily_balance) -> list[dict]:
+    """把逐笔发放原额按每日积分钱包实际余额摊薄。
+
+    rows 按到期日升序（调用方已排序）。从最早到期的一笔开始扣减余额，
+    余额耗尽后该笔及之后的笔目不再计入——那些积分已被用掉，不会因到期而损失。
+    """
+    if daily_balance is None:
+        return rows
+    try:
+        remaining = int(daily_balance)
+    except (TypeError, ValueError):
+        return rows
+    if remaining <= 0:
+        # 余额接口明确为 0：全部笔目已被消耗完，如实上报 0 笔到期。
+        # 不返回空数组——空数组会让账本保留旧快照，界面反而继续显示过期数字。
+        return [{"date": r["date"], "amount": 0, "source": r["source"]} for r in rows]
+
+    capped = []
+    for r in rows:
+        if remaining <= 0:
+            break
+        amount = min(r["amount"], remaining)
+        if amount > 0:
+            capped.append({"date": r["date"], "amount": amount, "source": r["source"]})
+        remaining -= amount
+    return capped
 
 
 def daily_grant_expiry(bills, today: str) -> str:
