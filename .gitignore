@@ -15,14 +15,13 @@ _ref_*/
 assets/_official_*/
 
 # 开发期验证脚本：回归本轮修复的测试网，不属于产品代码，不入库
-# 注意：scripts/ 下另有四个「看起来像临时文件」的模块其实是正式依赖，
+# （已移出 scripts/，统一放tests/，那里的说明见 tests/README.md）
+# 注意：scripts/ 下有五个「看起来像临时文件」的模块其实是正式依赖，
 # 由主脚本 import，必须入库，切勿用 scripts/_*.py 批量忽略：
 #   _autoclaw_credsync ← autoclaw.py / autoclaw_credits.py
 #   _raccoon_sync      ← 商汤小浣熊.py / 商汤小浣熊_credits.py
 #   _raccoon_expiry    ← 商汤小浣熊.py / 商汤小浣熊_credits.py
 #   _wbsync / _syncio  ← workbuddy.py / workbuddy_credits.py
-scripts/_verify_*.py
-scripts/_verify_*.mjs
 
 # AI 助手工作目录（项目记忆与本地配置，不属于代码）
 .workbuddy/

@@ -194,6 +194,7 @@ claw-checkin/
 ├── vendor/                  # 内置第三方组件（原样副本，各自许可证随目录附上）
 │   └── workbuddy/           # WorkBuddy 签到内核（来自 88lin/workbuddy-auto-signin，MIT）
 ├── examples/                # 示例脚本（演示输出契约）
+├── tests/                   # 开发期验证脚本（不入库，用法见 tests/README.md）
 ├── assets/                  # README 截图
 ├── data/                    # 运行时数据（ledger.json，已忽略）
 ├── config.example.yaml      # 默认配置模板
