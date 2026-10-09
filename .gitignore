@@ -14,15 +14,15 @@ _ref_*/
 # 第三方官方素材（仅本地参考图标，不入库）
 assets/_official_*/
 
-# 开发期临时验证脚本（下划线开头，均不被主代码引用）
-# 例外：_autoclaw_credsync 是「同步盘双机」功能的共享模块，被 autoclaw.py /
-# autoclaw_credits.py import，必须入库
+# 开发期验证脚本：回归本轮修复的测试网，不属于产品代码，不入库
+# 注意：scripts/ 下另有四个「看起来像临时文件」的模块其实是正式依赖，
+# 由主脚本 import，必须入库，切勿用 scripts/_*.py 批量忽略：
+#   _autoclaw_credsync ← autoclaw.py / autoclaw_credits.py
+#   _raccoon_sync      ← 商汤小浣熊.py / 商汤小浣熊_credits.py
+#   _raccoon_expiry    ← 商汤小浣熊.py / 商汤小浣熊_credits.py
+#   _wbsync / _syncio  ← workbuddy.py / workbuddy_credits.py
 scripts/_verify_*.py
 scripts/_verify_*.mjs
-scripts/_sync*.py
-scripts/_raccoon_*.py
-scripts/_wb*.py
-_rp.py
 
 # AI 助手工作目录（项目记忆与本地配置，不属于代码）
 .workbuddy/
