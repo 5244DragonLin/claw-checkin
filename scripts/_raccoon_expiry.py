@@ -84,11 +84,13 @@ def daily_expiring_from_bills(bills, today: str, daily_balance=None) -> list[dic
       账单里每笔 daily_grant 记的是**发放时原额**（如300×3=900），而余额接口
       `daily_points` 是每日积分钱包的**实际剩余**（如 867）。用户消耗积分后
       账单原额不变，直接相加会把已花掉的部分也算成「即将过期」，虚高。
-      积分池扣减不绑定具体笔目，故按到期日升序摊薄：把 daily_balance 从最早
-      到期的笔目起逐笔填满，填不满的最后一笔（最晚到期）取剩余值。这样
-      「14 天内将过期」= 真实会因到期而损失的积分，且总数恒等于 daily_points。
+      积分池扣减不绑定具体笔目，故按积分池实际的先进先出行为摊薄：**从最早到期的
+      笔目起逐笔扣减**，花掉的积分落在快过期的那笔上，剩余积分完整保留在较晚到期
+      的笔目上。三笔 300（10-13/14/15 到期）花 33 分、余额 867 时，结果为
+      267/300/300。这样「14 天内将过期」= 真实会因到期而损失的积分，且合计恒等
+      于 daily_points。
 
-    daily_balance 为 None 或 <= 0 时退回原额相加（老口径，仅作兜底）。
+    daily_balance 为 None 时退回原额相加（接口没给该字段时的兜底）。
     """
     agg: dict[tuple[str, str], int] = {}
     for item in _daily_grant_items(bills):
@@ -110,8 +112,15 @@ def daily_expiring_from_bills(bills, today: str, daily_balance=None) -> list[dic
 def _cap_to_daily_balance(rows: list[dict], daily_balance) -> list[dict]:
     """把逐笔发放原额按每日积分钱包实际余额摊薄。
 
-    rows 按到期日升序（调用方已排序）。从最早到期的一笔开始扣减余额，
-    余额耗尽后该笔及之后的笔目不再计入——那些积分已被用掉，不会因到期而损失。
+    rows 按到期日升序（调用方已排序）。
+
+    摊薄方向：**从最早到期的一笔开始扣减**。积分池先进先出——花掉的积分优先
+    扣最早过期那笔（快过期的先花掉，避免作废），所以剩余积分集中在**较晚到期**
+    的笔目上。例：三笔 300（10-13/14/15 到期）已花 33 分、余额 867时，
+    正确结果是 267/300/300 —— 10-13 被扣 33，两笔较晚到期的原额完整保留。
+
+    反过来（从最晚到期开始扣）会把消耗全甩给快过期的笔目，与积分池实际行为
+    相反，日历上表现为「越早到期剩得越多」，明显不合常理。
     """
     if daily_balance is None:
         return rows
@@ -119,20 +128,30 @@ def _cap_to_daily_balance(rows: list[dict], daily_balance) -> list[dict]:
         remaining = int(daily_balance)
     except (TypeError, ValueError):
         return rows
+
+    total = sum(r["amount"] for r in rows)
+    if remaining >= total:
+        return rows        # 余额覆盖全部笔目：原额不变
     if remaining <= 0:
-        # 余额接口明确为 0：全部笔目已被消耗完，如实上报 0 笔到期。
-        # 不返回空数组——空数组会让账本保留旧快照，界面反而继续显示过期数字。
+        # 余额接口明确为 0：全部笔目已被消耗完，如实上报 0 额。
+        # 不返回空数组——空数组会让账本保留旧快照，界面反而继续显示旧数字。
         return [{"date": r["date"], "amount": 0, "source": r["source"]} for r in rows]
 
-    capped = []
+    # 从最早到期的一笔开始扣：消耗掉的积分落在最早的笔目上
+    consumed = total - remaining          # 已被花掉的积分
+    out = []
     for r in rows:
-        if remaining <= 0:
-            break
-        amount = min(r["amount"], remaining)
-        if amount > 0:
-            capped.append({"date": r["date"], "amount": amount, "source": r["source"]})
-        remaining -= amount
-    return capped
+        if consumed <= 0:
+            out.append(r)
+            continue
+        amount = r["amount"]
+        if amount <= consumed:
+            # 这笔被扣光了，剩余积分全部落在更晚到期的笔目上
+            consumed -= amount
+            continue
+        out.append({"date": r["date"], "amount": amount - consumed, "source": r["source"]})
+        consumed = 0
+    return out
 
 
 def daily_grant_expiry(bills, today: str) -> str:
