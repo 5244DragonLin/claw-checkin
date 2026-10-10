@@ -424,12 +424,15 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
                 "amount": amount,
                 "items": items,
             })
-        # 过去 30 天已作废（与未来日历分开：这里取全量，含已被接口移除的历史行）
+        # 过去 30 天已作废（与未来日历分开：取全量历史行，但只计「到期日结束时
+        # 平台仍持有」的行，即存储 live=1；live=0 是到期前被花掉的消耗流水，
+        # 接口当天不再回报即判为已用，不计入作废）
         cutoff = (today - timedelta(days=30)).strftime("%Y-%m-%d")
         for e in _expiring_rows(live_only=False):
             if _expiry_group(e["platform"]) not in visible_names:
                 continue
-            if cutoff <= e["date"] < today.strftime("%Y-%m-%d"):
+            if cutoff <= e["date"] < today.strftime("%Y-%m-%d") \
+                    and int(e.get("live", 1) or 0) == 1:
                 void30 += e["amount"]
         return {
             "weeks": weeks, "void30": void30,

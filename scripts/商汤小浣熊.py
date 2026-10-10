@@ -17,12 +17,10 @@
 状态已记过今天 → ALREADY；今日无签到事件入账且核对成功 → 同样 ALREADY（可能
 已由桌面端领取过）。收益只认这两类事件——老用户回馈等运营活动入账不计入
 today_credit。连续天数只在首次确认入账的当天 +1（last_date 守卫，同日重跑不双计）。
-每日积分有效期自适应（scripts/_raccoon_expiry.py，2026-10 核实官方口径）：
-每日积分每天 00:00 发放，默认当日 24:00 清零，当天登录后有效期延长至 7 天。
-本脚本的 API 签到是否被服务端算作「当天登录」尚无干净样本，不做假设：
-签到报告直接写明本笔到期时刻（读账单 expire_at）；临期快照统一由隐藏积分源
-商汤小浣熊_credits.py 上报（两个脚本同报会被账本按平台名双计），
-24 小时 / 7 天两种模式自适应，历史硬编码「当日清零」已废弃。
+每日积分有效期（2026-10-09 干净实验定论）：API 签到被服务端认定为「当天登录」，
+每日积分有效期延长至 7 天。签到报告只报结果与收益，不追加到期/余额明细——
+到期与临期统一由隐藏积分源 商汤小浣熊_credits.py 逐笔读账单 expire_at 上报
+（scripts/_raccoon_expiry.py；两个脚本同报会被账本按平台名双计）。
 
 凭据与续期（access 有效期仅约 3 小时）：见 scripts/_raccoon_sync.py——
 桌面端登录态 ~/.box-agent/config/auth.json 优先，过期自动用 refreshToken
@@ -49,7 +47,6 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _raccoon_sync as rc  # noqa: E402  同目录共享模块：凭据漫游/续期/请求层
-import _raccoon_expiry as rx  # noqa: E402  同目录共享模块：每日积分有效期自适应
 
 PATH_GRANT = "/api/web/desktop/v1/login/points/grant"
 PATH_SETTING = "/api/web/office/v3/setting_info"
@@ -58,8 +55,8 @@ PATH_BALANCE = "/api/web/points/v1/balance"
 BILLS_TIMEOUT = 30      # 账单接口实测约 9 秒，独立超时兜底（agent2api 同款）
 
 # 签到相关的账单事件（实测口径，2026-10）：
-#   每日积分发放 —— 每日签到收益，有效期自适应：默认当日 24:00 清零，当天
-#                  登录后延长至 7 天（逐笔读账单 expire_at，见 _raccoon_expiry）；
+#   每日积分发放 —— 每日签到收益：默认当日 24:00 清零，当天登录（含本脚本
+#                  的 API 签到）后延长至 7 天；到期明细由 _raccoon_expiry 读账单；
 #   桌面端登录奖励 —— 首次桌面登录的一次性奖励（发放链路 ① 领取的那笔）。
 # 其余正数入账（老用户回馈等运营活动）不计入签到收益，避免误记。
 DAILY_GRANT_EVENT = "每日积分发放"
@@ -194,11 +191,6 @@ def _run() -> dict:
             parts.append(f"首次桌面登录奖励 +{bonus}")
         if parts:
             report += "，" + "，".join(parts)
-        expiry_date = rx.daily_grant_expiry(bills, today)
-        if expiry_date:
-            report += f"，本笔 {expiry_date} 24:00 过期"
-        if total:
-            report += f"，余额 {total} 积分"
         out = _out("CLAIMED", report, granted_today,
                    state["streak_days"], total)
         return out
@@ -215,8 +207,6 @@ def _run() -> dict:
         report += f"；今日另有 {other} 分非签到入账（运营活动等）"
     if setting.get("error"):
         report += f"；发放触发器异常：{setting['error']}"
-    if total:
-        report += f"，余额 {total} 积分"
     return _out("ALREADY", report, 0, state["streak_days"], total)
 
 
