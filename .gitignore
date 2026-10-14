@@ -39,3 +39,7 @@ venv/
 # 系统杂项
 .DS_Store
 Thumbs.db
+
+# AI 助手本地缓存目录（task-registry、调试截图、tt.db 等，非项目代码）
+.box-agent/
+.box-agent-scratch/
