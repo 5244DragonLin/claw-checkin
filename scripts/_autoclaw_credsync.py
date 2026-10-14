@@ -71,6 +71,11 @@ def fallback_refresh(auth_dir: str, *, upsert, remote_refresh, jwt_exp,
     upsert(auth_dir, access, exp) / remote_refresh(refresh, device_id, old_access)
     / jwt_exp(token) / vault_writer(vault, access, refresh) / client_running()
     由调用脚本注入，保持与各自的既有实现一致。
+
+    客户端运行中（client_running() 为真）时不再直接放弃，而是**只续到项目内
+    auths/**：这是为了打破「客户端在跑→脚本不碰凭据库，客户端自己又没轮换→
+    两边都不动、token 干等过期」的死锁。凭据库（vault）此时一律不写，避免与
+    客户端抢内存态凭据；客户端那份留待其自行刷新，互不干扰。
     """
     mirror = load()
     if not mirror:
@@ -78,14 +83,13 @@ def fallback_refresh(auth_dir: str, *, upsert, remote_refresh, jwt_exp,
     running = bool(client_running()) if client_running else False
     if mirror["exp"] > time.time() + 300:
         return upsert(auth_dir, mirror["access"], mirror["exp"])
-    if running:
-        return False  # 客户端运行中会自行轮换，不并发续期
     renewed = remote_refresh(mirror["refresh"], mirror["device_id"], mirror["access"])
     if not renewed:
         return False
     exp = jwt_exp(renewed["access"].split(" ", 1)[-1])
     note(renewed["access"], renewed["refresh"], exp, mirror["device_id"], mirror["region"])
-    if vault and vault_writer:
+    # 客户端运行中：只把新 token 落到项目 auths/，绝不写桌面端凭据库
+    if vault and vault_writer and not running:
         vault_writer(vault, renewed["access"], renewed["refresh"])
     return upsert(auth_dir, renewed["access"], exp)
 

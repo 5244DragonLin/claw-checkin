@@ -363,9 +363,15 @@ def _upsert_autoclaw_auth(auth_dir: str, access: str, exp: float) -> bool:
 
 
 def _refresh_from_autoclaw2(auth_dir: str) -> bool:
-    """AutoClaw 2 凭据自动就绪：本地凭据库优先（token 有效直接采用；过期且
-    客户端未运行时用 refreshToken 自主续期并写回凭据库），走不通时退回跨机
-    会话镜像 auths/autoclaw_sync.json（同步盘双机轮流使用，见 _autoclaw_credsync）。
+    """AutoClaw 2 凭据自动就绪：本地凭据库优先（token 有效直接采用；过期时用
+    refreshToken 自主续期——客户端运行中也允许续，但只写项目内 auths/，不碰
+    桌面端凭据库），走不通时退回跨机会话镜像 auths/autoclaw_sync.json（同步盘
+    双机轮流使用，见 _autoclaw_credsync）。
+
+    「客户端运行中不碰凭据库」的初衷是避免与客户端抢内存态凭据；但实测存在
+    死锁：客户端虽在运行却不会自行轮换，脚本又因它在跑而放弃续期，token 干等
+    过期导致签到 401。故改为：续期照做，仅「写回凭据库」这一步在客户端运行时
+    跳过；项目 auths/ 始终更新，签到不再被卡。
     """
     vault = _read_autoclaw2_vault()
     device_id = _autoclaw2_device_id()
@@ -373,14 +379,15 @@ def _refresh_from_autoclaw2(auth_dir: str) -> bool:
         credsync.note(vault["access"], vault["refresh"], vault["exp"], device_id)
         if vault["exp"] > time.time() + 300:
             return _upsert_autoclaw_auth(auth_dir, vault["access"], vault["exp"])
-        if not _autoclaw2_running():
-            renewed = _autoclaw2_remote_refresh(vault["refresh"], device_id, vault["access"])
-            if renewed:
+        renewed = _autoclaw2_remote_refresh(vault["refresh"], device_id, vault["access"])
+        if renewed:
+            # 客户端运行中不写凭据库（防并发抢凭据），但仍写项目 auths/
+            if not _autoclaw2_running():
                 _write_autoclaw2_vault(vault, renewed["access"], renewed["refresh"])
-                credsync.note(renewed["access"], renewed["refresh"],
-                              _jwt_exp(renewed["access"].split(" ", 1)[-1]), device_id)
-                return _upsert_autoclaw_auth(auth_dir, renewed["access"],
-                                             _jwt_exp(renewed["access"].split(" ", 1)[-1]))
+            credsync.note(renewed["access"], renewed["refresh"],
+                          _jwt_exp(renewed["access"].split(" ", 1)[-1]), device_id)
+            return _upsert_autoclaw_auth(auth_dir, renewed["access"],
+                                         _jwt_exp(renewed["access"].split(" ", 1)[-1]))
     return credsync.fallback_refresh(
         auth_dir,
         upsert=_upsert_autoclaw_auth,

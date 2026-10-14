@@ -28,8 +28,10 @@
 说明：
     - 「累计积分」= 真正能用的额度，故体验版（CapacityType=4）周期剩余也计入 total_credits：
       日常消耗优先扣赠送包，赠送包用尽后才动用这每月 500，因此它是一份真实的可用余额。
-    - 体验版是「按月重置」而非「到期作废」，故不计入 expiring（进不了过期日历），
-      只在 report 中提示当月剩余与重置日。
+    - 体验版按月结算（CycleEndTime = 当月末 23:59:59），当月没用完的部分不会留到下月，
+      故与赠送包一样按周期结束日进过期日历；source 固定标为「体验版额度（每月重置）」，
+      与赠送包区分开——它是周期额度到期换血，不是权益包失效，混淆后用户会误以为
+      它是长期余额。
     - 已用尽的包（剩余 0）不计入 expiring。
 """
 
@@ -53,6 +55,10 @@ DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 TOKEN_LIMIT = 32768
 HELPER_TIMEOUT = 15.0
+
+# 体验版周期额度的固定 source 标签：标签必须跨天稳定（账本按 (date, amount, source)
+# 去重，标签漂移会让同一格新旧两行同现、统计双计），也不要带日期。
+TRIAL_SOURCE = "体验版额度（每月重置）"
 
 AUTH_REASONS = {
     "INVALID_FORMAT": "登录凭据格式无效，请检查凭据来源和客户端版本",
@@ -332,9 +338,12 @@ def _cycle_end_date(cycle_end):
 
 
 def build_expiring(accounts):
-    """解析 Accounts：仅纳入权益赠送包（CapacityType != 4）且剩余 > 0 的未来到期项。
+    """解析 Accounts：纳入所有剩余 > 0 且到期日在今天的未来项。
 
-    体验版（CapacityType=4）为周期额度重置，不计入"积分过期"日历。
+    赠送包（CapacityType != 4）按各包自己的到期日进日历；体验版（CapacityType=4）
+    是周期额度，按周期结束日（当月月末）进日历、source 固定为 TRIAL_SOURCE——
+    当月没用完的部分不会留到下月，不报就会出现「总积分里有 500 分即将到期、
+    日历上却完全看不到」的缺口。
     返回 (expiring, summary)。
     """
     today = date.today().isoformat()
@@ -373,12 +382,12 @@ def build_expiring(accounts):
 
     expiring = []
     for p in packages:
-        if p["is_trial"] or p["remain"] <= 0 or not p["cycle_end"] or p["cycle_end"] < today:
+        if p["remain"] <= 0 or not p["cycle_end"] or p["cycle_end"] < today:
             continue
         expiring.append({
             "date": p["cycle_end"],
             "amount": int(math.ceil(p["remain"])),
-            "source": p["name"],
+            "source": TRIAL_SOURCE if p["is_trial"] else p["name"],
         })
     expiring.sort(key=lambda e: e["date"])
 

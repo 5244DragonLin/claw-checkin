@@ -443,7 +443,8 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
     def api_logs(filter_name: str = "all", limit: int = 10, offset: int = 0):
         total = ledger.logs_count(filter_name)
         rows = ledger.logs(filter_name, limit, offset)
-        return {"total": total, "count": len(rows), "logs": [dict(r) for r in rows]}
+        return {"total": total, "count": len(rows),
+                "retention_days": cfg.ledger.retention_days, "logs": [dict(r) for r in rows]}
 
     @app.get("/api/logs/export")
     def api_logs_export():

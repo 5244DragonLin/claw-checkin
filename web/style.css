@@ -161,8 +161,21 @@ h1.page-title { font-size: 26px; font-weight: 800; letter-spacing: .5px; }
 .exec-tag { font-size: 12px; background: var(--tag-bg); border-radius: 6px; padding: 2px 8px; color: var(--tag-tx); }
 
 /* ---------- 表格 ---------- */
+/* 表格：全局仍用内容自适应（auto）布局，避免压坏总览临期表等窄表。
+   只有运行日志表显式定死列宽（见 #log-body table），防止切换筛选时
+   因内容长度不同导致列宽被重算、整张表左右抖动。 */
 .table-wrap { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; overflow-y: hidden; }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+/* 运行日志表格：固定布局 + 显式列宽（时间/平台/脚本/状态/积分/返回明细/触发） */
+#log-body table { table-layout: fixed; }
+#log-body table th:nth-child(1), #log-body table td:nth-child(1) { width: 11%; }
+#log-body table th:nth-child(2), #log-body table td:nth-child(2) { width: 11%; }
+#log-body table th:nth-child(3), #log-body table td:nth-child(3) { width: 15%; }
+#log-body table th:nth-child(4), #log-body table td:nth-child(4) { width: 9%; }
+#log-body table th:nth-child(5), #log-body table td:nth-child(5) { width: 7%; }
+#log-body table th:nth-child(6), #log-body table td:nth-child(6) { width: 40%; }
+#log-body table th:nth-child(7), #log-body table td:nth-child(7) { width: 7%; }
+#log-body table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12.5px; padding: 13px 18px; border-bottom: 1px solid var(--border); background: var(--row-alt); white-space: nowrap; }
 td { padding: 13px 18px; border-bottom: 1px solid var(--row-line); }
 tr:last-child td { border-bottom: none; }
@@ -185,10 +198,11 @@ tr.clickable:hover td { background: var(--row-alt); }
 .week-card .label { font-size: 12.5px; opacity: .7; }
 .week-card .value { font-size: 26px; font-weight: 800; margin-top: 8px; }
 .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 12px; margin-top: 20px; }
-.cal-cell { border-radius: 12px; padding: 13px 14px; min-height: 96px; background: var(--card); border: 1px solid var(--border); }
+.cal-cell { display: flex; flex-direction: column; align-items: flex-start; border-radius: 12px; padding: 13px 14px; min-height: 96px; background: var(--card); border: 1px solid var(--border); }
 .cal-cell .d { font-size: 13px; font-weight: 700; }
 .cal-cell .p { font-size: 12px; color: var(--muted); margin-top: 6px; }
-.cal-cell .v { font-size: 20px; font-weight: 800; margin-top: 4px; }
+/* 分数钉在卡片底部：平台名一行或两行都不影响同一行分数的水平对齐 */
+.cal-cell .v { font-size: 20px; font-weight: 800; margin-top: auto; padding-top: 4px; }
 .cal-cell.empty { color: var(--empty-tx); background: var(--row-alt); border-style: dashed; }
 /* 日历格与周卡片共用 --w1~--w4 变量，永远同色。
    第1周→第4周对应 0-6 天 → 21-27 天到期，色相沿红→橙→黄→青递进。 */

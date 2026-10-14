@@ -6,11 +6,21 @@ const PLATFORM_ICON = {
   workbuddy: "/static/icons/workbuddy.svg",
   autoclaw: "/static/icons/autoclaw.png",
   商汤小浣熊: "/static/icons/raccoon.png",
+  qoder: "/static/icons/qoder.png",
 };
+// 日志/卡片展示名：隐藏积分源（*_credits）与主平台脚本归一到同一平台名，
+// 不带「积分」后缀，避免运行日志里同一平台出现两种叫法。
 const DISPLAY_NAMES = {
-  workbuddy_credits: "WorkBuddy 积分",
-  autoclaw_credits: "AutoClaw 积分",
-  商汤小浣熊_credits: "商汤小浣熊积分",
+  workbuddy: "WorkBuddy",
+  workbuddy_credits: "WorkBuddy",
+  autoclaw: "AutoClaw",
+  autoclaw_credits: "AutoClaw",
+  商汤小浣熊: "商汤小浣熊",
+  商汤小浣熊_credits: "商汤小浣熊",
+  raccoon: "商汤小浣熊",
+  raccoon_credits: "商汤小浣熊",
+  qoder: "Qoder",
+  qoder_credits: "Qoder",
 };
 const displayName = (name) => DISPLAY_NAMES[name] || name;
 const iconFor = (name) => {
@@ -524,7 +534,7 @@ async function loadLogs(page = logPage) {
     const d = await api(`/api/logs?filter_name=${logFilter}&limit=${LOG_PAGE_SIZE}&offset=${offset}`);
     const totalPages = Math.max(1, Math.ceil(d.total / LOG_PAGE_SIZE));
     // 从全量日志统计今日数字（简版：用当前返回展示条数）
-    $("#log-sub").textContent = "数据来源：各脚本 stdout 的一行 JSON + data/ledger.json 的 checkin_log 表 · 本地保留 90 天";
+    $("#log-sub").textContent = `数据来源：各脚本 stdout 的一行 JSON + data/ledger.json 的 checkin_log 表 · 本地保留 ${d.retention_days || 30} 天`;
     if (!d.logs.length) {
       if (page > 1) { loadLogs(1); return; }
       if (logFilter === "all") {

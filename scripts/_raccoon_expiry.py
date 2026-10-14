@@ -91,6 +91,19 @@ def daily_expiring_from_bills(bills, today: str, daily_balance=None) -> list[dic
       于 daily_points。
 
     daily_balance 为 None 时退回原额相加（接口没给该字段时的兜底）。
+
+    余额为 0（2026-10-13 修正）：daily_points == 0 表示每日积分钱包已被消耗干净，
+    真实的「会因到期损失」的积分为 0，直接返回空数组（旧实现返回等量 0 额行，
+    日历会凭空多出「0 分」格、卡片仍标「有临期」）。注意 0 与 None 语义相反：
+    调用方必须如实把 0 传进来，不可写成 `x if x > 0 else None`，否则退回原额
+    相加，把账单里早已花掉的发放原额当成临期积分上报。
+
+    余额 > 笔目合计（2026-10-12 修正）：账单窗口没覆盖全部未到期笔目时（拉取
+    limit 不足 / 上游截断），笔目合计会小于 daily_points，此时差额是真实存在于
+    每日积分钱包、且即将到期的积分。旧实现「余额覆盖即原额不变」把差额静默丢弃
+    （实测 limit=40 只拿到未来 2 笔 600、余额 1024，日历漏报 424），现改为把差额
+    挂到最早到期日，合计恒等于 daily_points。账单一个 daily_grant 都没有时仍返回
+    空——上游没给数据时不凭空捏造到期日。
     """
     agg: dict[tuple[str, str], int] = {}
     for item in _daily_grant_items(bills):
@@ -131,11 +144,30 @@ def _cap_to_daily_balance(rows: list[dict], daily_balance) -> list[dict]:
 
     total = sum(r["amount"] for r in rows)
     if remaining >= total:
-        return rows        # 余额覆盖全部笔目：原额不变
+        # 余额 ≥ 笔目合计：账单拉全时两者应相等。若余额仍大于合计，说明账单窗口
+        # 没覆盖到全部未到期笔目（limit 不够 / 上游截断），差额是真实存在于每日
+        # 积分钱包、且即将到期的积分，绝不能静默丢弃——挂到最早到期日，如实进
+        # 日历（宁可到期日早报一天，也不要让用户看不到这部分会作废的分）。
+        #
+        # 仅在有笔目时兜底：账单里一个 daily_grant 都没有说明上游没给数据，此时
+        # 凭空造一条等于捏造积分与到期日，仍返回空（缺失即该平台不参与统计）。
+        gap = remaining - total
+        if gap > 0 and rows:
+            first = dict(rows[0])
+            first["amount"] += gap
+            rows = [first] + list(rows[1:])
+        return rows
     if remaining <= 0:
-        # 余额接口明确为 0：全部笔目已被消耗完，如实上报 0 额。
-        # 不返回空数组——空数组会让账本保留旧快照，界面反而继续显示旧数字。
-        return [{"date": r["date"], "amount": 0, "source": r["source"]} for r in rows]
+        # 余额接口明确为 0：每日积分钱包一分为空，没有任何一笔会因到期而损失，
+        # 返回空数组（清空该平台的临期快照）。
+        #
+        # 旧实现返回等量「0 额行」，想法是「空数组会残留旧快照」，但账本并不这样
+        # 工作（ledger._update_snapshots_locked：result=ALREADY 的正常回报照常
+        # 覆盖——未来行按平台整体重建、今天行打 live=0），残留不会发生；而 0 额行
+        # 会真的进日历占格（显示「x 分 · 0」）、平台卡片仍标「有临期」，把「钱包
+        # 已空」误报成「有临期积分」，正是 2026-10-13 真机上「总积分全是明年才过期
+        # 的奖励分，本周却天天有小浣熊临期」的来源之一。
+        return []
 
     # 从最早到期的一笔开始扣：消耗掉的积分落在最早的笔目上
     consumed = total - remaining          # 已被花掉的积分

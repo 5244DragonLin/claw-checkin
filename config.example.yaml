@@ -14,7 +14,7 @@ scripts:
 # 每日自动签到
 schedule:
   enabled: true       # 到点自动把 scripts/ 下所有平台各跑一遍
-  time: "00:05"       # 触发时刻（HH:MM）；错过时刻（如关机）会在当日开机后补跑一次
+  time: "10:30"      # 触发时刻（HH:MM）；错过时刻（如关机）会在当日开机后补跑一次（Qoder 活动窗口 10:00 开窗，故排在之后）
 
 # 积分余额刷新（纯查询、不签到；只补跑隐藏 *_credits 积分源）
 credits:
@@ -24,7 +24,7 @@ credits:
 # 账本（单文件 JSON，同步盘双机友好；旧 data/ledger.db 首次启动自动迁移）
 ledger:
   db: data/ledger.json  # 签到日志与临期积分快照
-  retention_days: 90    # 日志本地保留天数，过期自动清理
+  retention_days: 30    # 日志本地保留天数，过期自动清理
 
 # 日志
 logging:

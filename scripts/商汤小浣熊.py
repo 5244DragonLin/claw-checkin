@@ -50,7 +50,8 @@ import _raccoon_sync as rc  # noqa: E402  同目录共享模块：凭据漫游/�
 
 PATH_GRANT = "/api/web/desktop/v1/login/points/grant"
 PATH_SETTING = "/api/web/office/v3/setting_info"
-PATH_BILLS = "/api/web/points/v1/bills?paging.limit=40&paging.offset=0"
+# limit 与积分源保持一致：覆盖全部未到期的每日积分笔目（7 天有效期 → 至少 7 天）
+PATH_BILLS = "/api/web/points/v1/bills?paging.limit=200&paging.offset=0"
 PATH_BALANCE = "/api/web/points/v1/balance"
 BILLS_TIMEOUT = 30      # 账单接口实测约 9 秒，独立超时兜底（agent2api 同款）
 

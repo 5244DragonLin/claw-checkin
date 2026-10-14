@@ -26,7 +26,7 @@ class ScriptsConfig:
 @dataclass
 class ScheduleConfig:
     enabled: bool = True
-    time: str = "00:05"           # 每日自动签到时间 HH:MM
+    time: str = "10:30"          # 每日自动签到时间 HH:MM（Qoder 活动窗口 10:00 开窗）
 
 
 @dataclass
@@ -38,7 +38,7 @@ class CreditsConfig:
 @dataclass
 class LedgerConfig:
     db: str = "data/ledger.json"  # 账本（单文件 JSON，同步盘友好；旧 .db 配置自动兼容）
-    retention_days: int = 90      # 日志本地保留天数
+    retention_days: int = 30      # 日志本地保留天数
     snapshot_retention_days: int = 31  # 临期积分快照保留天数
 
 
@@ -71,9 +71,9 @@ class AppConfig:
 _DEFAULTS = {
     "server": {"host": "127.0.0.1", "port": 8317},
     "scripts": {"dir": "scripts", "timeout": 120},
-    "schedule": {"enabled": True, "time": "00:05"},
+    "schedule": {"enabled": True, "time": "10:30"},
     "credits": {"refresh_interval": 300, "page_load_debounce": 30},
-    "ledger": {"db": "data/ledger.json", "retention_days": 90,
+    "ledger": {"db": "data/ledger.json", "retention_days": 30,
                "snapshot_retention_days": 31},
     "logging": {"level": "INFO", "file": ""},
 }
