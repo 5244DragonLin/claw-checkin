@@ -9,8 +9,11 @@ auths/ 目录（随同步盘漫游）。accessToken 有效期长达 55 天（aut
 4752000 秒），另一台电脑即使不登录客户端也能直接用。
 
 新旧比较用 auth.expiresAt（毫秒时间戳，凭据文件里明文可读），无须解密即可判断
-本地与镜像哪份更新。镜像文件与桌面端凭据同构，signin.py 通过 WORKBUDDY_AUTH_FILE
-直接消费。
+本地与镜像哪份更新。**但过期时间不等于能用**：桌面端每次刷新会话后，服务端会
+作废先前签发的 accessToken，镜像里那份的日期可能更晚、实际已被拒绝（HTTP 401）。
+因此选择顺序按「谁一定还在台上」而不是「谁日期更晚」：本机凭据可用就用本机，
+镜像只在本机凭据缺失或过期时兜底。镜像文件与桌面端凭据同构，signin.py 通过
+WORKBUDDY_AUTH_FILE 直接消费。
 """
 
 from __future__ import annotations
@@ -77,26 +80,52 @@ def token_of(session: dict | None):
 def pick() -> tuple[str | None, str]:
     """选择 signin.py / 积分脚本应使用的凭据文件，返回 (path, source)。
 
-    source ∈ local / mirror / none。本地与镜像都在时取 expiresAt 较新的一份；
-    同为 0（无时间戳可比）时本地优先——本机存在凭据文件本身就代表本机登录过。
+    source ∈ local / mirror / none。**本机优先**：本机凭据存在且未过期就直接用。
+    桌面端会持续刷新它，是唯一「一定还在台上」的一份；镜像只是给没登录的电脑
+    兜底，本机凭据缺失或已过期时才轮到它。
+
+    早先按 expiresAt 取较新一份，会被镜像里那份自报日期更晚、实则已被服务端
+    作废的明文 token 长期劫持（全员 HTTP 401），故改为就近优先。
     """
+    now = time.time()
     local = local_auth_file()
-    mirror_exists = os.path.isfile(MIRROR_PATH)
-    local_exp = session_expiry(load_session_file(local)) if local else 0.0
-    mirror_exp = session_expiry(load_session_file(MIRROR_PATH)) if mirror_exists else 0.0
-    if local and (not mirror_exists or local_exp >= mirror_exp):
-        return local, "local"
-    if mirror_exists:
+    if local:
+        exp = session_expiry(load_session_file(local))
+        if exp > now:
+            return local, "local"
+    if os.path.isfile(MIRROR_PATH):
         return MIRROR_PATH, "mirror"
+    if local:
+        # 本机凭据已过期，但报「已过期，请重新登录」比「未找到凭据」更准确
+        return local, "local"
     return None, "none"
 
 
-def sync_mirror(session: dict, plaintext_token: str) -> bool:
-    """把已解密的完整会话写入镜像；镜像已明显更新则跳过（单调守卫）。"""
+def alternate(path: str | None) -> str | None:
+    """返回与 path 互为备份的另一份凭据文件；没有或与 path 同一份则 None。
+
+    一份被服务端拒绝时，用它去试另一份（本机 ↔ 镜像）。
+    """
+    for cand in (local_auth_file(), MIRROR_PATH):
+        if not cand or not os.path.isfile(cand):
+            continue
+        if path and os.path.abspath(cand) == os.path.abspath(path):
+            continue
+        return cand
+    return None
+
+
+def sync_mirror(session: dict, plaintext_token: str, force: bool = False) -> bool:
+    """把已解密的完整会话写入镜像。
+
+    force=False 时保留单调守卫：镜像明显更新就跳过。守卫只比 expiresAt，
+    而 expiresAt 能被服务端作废的事实推翻，所以「某份凭据刚被服务端接受」
+    这类有实证的场景必须 force=True。
+    """
     if not isinstance(session, dict) or not plaintext_token:
         return False
     mirror = load_session_file(MIRROR_PATH)
-    if mirror and session_expiry(mirror) > session_expiry(session) + 60:
+    if not force and mirror and session_expiry(mirror) > session_expiry(session) + 60:
         return False
     out = copy.deepcopy(session)
     out.setdefault("auth", {})["accessToken"] = plaintext_token
@@ -116,8 +145,11 @@ def maybe_sync_mirror(path: str | None, plaintext_token: str) -> bool:
         return False
 
 
-def update_from_local(signin_path: str) -> str:
-    """签到包装层在调 signin.py 前调用：尽力把本地凭据同步进镜像。
+def update_from_local(signin_path: str, force: bool = False) -> str:
+    """签到包装层在调 signin.py 前调用：尽力把本机凭据同步进镜像。
+
+    force=True 表示本机这份凭据已被服务端接受过（有实证），跳过「镜像日期更晚
+    就不用换」的乐观判断，直接覆盖。
 
     返回状态串（供日志/排查）：synced / mirror-ok / mirror-newer /
     local-plaintext / no-local / resolve-failed。
@@ -131,22 +163,50 @@ def update_from_local(signin_path: str) -> str:
 
     if isinstance(token, str):
         # 明文凭据：直接镜像（桌面端旧版未启用加密信封）
-        if sync_mirror(session, token):
+        if sync_mirror(session, token, force=force):
             return "local-plaintext"
         return "mirror-newer"
 
     if isinstance(token, dict):
         # 加密信封：镜像里已有未过期的明文会话就不必再跑一次客户端解密
-        if mirror and isinstance(token_of(mirror), str) \
+        if not force and mirror and isinstance(token_of(mirror), str) \
                 and session_expiry(mirror) > time.time() + MIRROR_MIN_TTL_SECONDS \
                 and session_expiry(mirror) >= session_expiry(session) - 60:
             return "mirror-ok"
         plaintext = _resolve_via_signin(signin_path, session)
         if not plaintext:
             return "resolve-failed"
-        return "synced" if sync_mirror(session, plaintext) else "resolve-failed"
+        return "synced" if sync_mirror(session, plaintext, force=force) else "resolve-failed"
 
     return "no-local"
+
+
+def heal_mirror(auth_file: str | None, signin_path: str) -> bool:
+    """某份凭据刚被服务端成功接受：用它刷新镜像，让另一台电脑也能用。
+
+    与 update_from_local 的差别是先有实证再写，因此绕过单调守卫——守卫只看
+    expiresAt，而「日期更晚」既不保证能用，也不该挡住一份刚验证过可用的凭据。
+    """
+    if not auth_file or not signin_path:
+        return False
+    session = load_session_file(auth_file)
+    if not session:
+        return False
+    token = token_of(session)
+    plaintext = token if isinstance(token, str) else _resolve_via_signin(signin_path, session)
+    return heal_mirror_with_token(auth_file, plaintext)
+
+
+def heal_mirror_with_token(auth_file: str | None, plaintext_token: str | None) -> bool:
+    """调用方手里已有明文 token（刚被服务端接受）时直接回写镜像。"""
+    if not auth_file or not plaintext_token:
+        return False
+    if os.path.abspath(auth_file) == os.path.abspath(MIRROR_PATH):
+        return False
+    session = load_session_file(auth_file)
+    if not session:
+        return False
+    return sync_mirror(session, plaintext_token, force=True)
 
 
 def _resolve_via_signin(signin_path: str, session: dict) -> str | None:

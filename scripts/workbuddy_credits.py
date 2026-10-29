@@ -250,13 +250,13 @@ def run_auth_helper(exe, request):
     return reply, None
 
 
-def load_login():
+def load_login(path=None):
     """读取 WorkBuddy 登录态，返回 (token_path, token, uid, err)。
 
-    本机凭据与跨机同步镜像（auths/workbuddy-desktop.info，明文 token）取
-    expiresAt 较新的一份——双机轮流使用时镜像可能比本机登录态更新。
+    path 为空时按本地优先规则现选一份（本机凭据可用就用本机，镜像只作兜底）。
     """
-    path, _source = _wbsync.pick()
+    if path is None:
+        path, _source = _wbsync.pick()
     d = _wbsync.load_session_file(path)
     if d is None:
         return None, None, None, "NO_SESSION_FILE"
@@ -418,24 +418,43 @@ def emit(result, report, total_credits=0, expiring=None):
     }, ensure_ascii=False))
 
 
+def fetch_with_fallback():
+    """取积分：主凭据被服务端拒绝就换另一份重试，成功的那份回写镜像。
+
+    返回 (accounts, err, path)。err 为 None 表示拿到数据；否则是最后一次的失败原因。
+    """
+    primary, _source = _wbsync.pick()
+    err = "NO_SESSION_FILE"
+    for path in (primary, _wbsync.alternate(primary)):
+        if not path:
+            continue
+        _p, token, uid, load_err = load_login(path)
+        if load_err:
+            err = load_err
+            continue
+        tok, derr = resolve_token(token)
+        if derr:
+            err = derr
+            continue
+        accounts, ferr = fetch_user_resource(tok, uid)
+        if ferr:
+            err = ferr
+            if ferr in ("AUTH_REJECTED", "FORBIDDEN"):
+                continue                      # 换另一份凭据再试
+            return None, ferr, path
+        # 这份凭据刚被服务端接受：顺手把明文会话写进跨机镜像（path 为镜像自身时跳过）
+        _wbsync.heal_mirror_with_token(path, tok)
+        return accounts, None, path
+    return None, err, primary
+
+
 def main():
-    _path, token, uid, load_err = load_login()
-    if load_err:
-        emit("NO_SESSION", "未找到 WorkBuddy 登录态文件，请先登录 WorkBuddy 客户端")
-        return 2
-
-    tok, derr = resolve_token(token)
-    if derr:
-        emit("NO_AUTH", "WorkBuddy 凭据处理失败：" + AUTH_REASONS.get(derr, derr))
-        return 2
-
-    # 本机凭据解密成功：顺手把明文会话同步进跨机镜像（能解密的一侧负责产出，
-    # 另一台电脑不登录客户端也能用；path 为镜像自身时自动跳过）
-    _wbsync.maybe_sync_mirror(_path, tok)
-
-    accounts, ferr = fetch_user_resource(tok, uid)
-    if ferr:
-        if ferr == "AUTH_REJECTED":
+    accounts, ferr, _path = fetch_with_fallback()
+    if ferr is not None:
+        if ferr in ("NO_SESSION_FILE", "RUNTIME_NOT_FOUND", "KEY_MISMATCH", "DECRYPT_FAILED",
+                    "HELPER_PROTOCOL", "INVALID_FORMAT", "UNSUPPORTED_ENVELOPE"):
+            emit("NO_SESSION", "WorkBuddy 凭据处理失败：" + AUTH_REASONS.get(ferr, ferr))
+        elif ferr == "AUTH_REJECTED":
             emit("NO_AUTH", "服务端拒绝认证（HTTP 401），请重新登录 WorkBuddy")
         elif ferr == "FORBIDDEN":
             emit("NO_AUTH", "服务端拒绝访问（HTTP 403），请检查登录状态")

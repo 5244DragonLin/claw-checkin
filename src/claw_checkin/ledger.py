@@ -89,6 +89,44 @@ def _snap_key(row: dict) -> tuple:
     return (row["platform"], row["date"], row["amount"], row["source"])
 
 
+def _amount_of(entry: dict) -> int:
+    """expiring 金额转整数，非法值按 0 处理（脚本字段脏不能拖垮整次入账）。"""
+    try:
+        return int(entry.get("amount", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def aggregate_expiring(expiring) -> list[dict]:
+    """把一次回报的 expiring 按 (date, source) 合并求和。
+
+    同一来源同一天可能对应多笔互相独立的权益包（实测 WorkBuddy 在 2026-11-15
+    就有 3 笔各 100 分的裂变包），而快照表按 (platform, date, amount, source) 判重：
+    不先合并就会把 3 笔并成 1 笔，日历少算 200 分。合并后同一份回报的集合是稳定的，
+    重复回报也能逐字段比对出来「有没有真的变」，不会每次都误判为有变化。
+    """
+    totals: dict[tuple[str, str], int] = {}
+    for e in expiring:
+        if not isinstance(e, dict) or not e.get("date"):
+            continue
+        key = (str(e["date"]), str(e.get("source", "")))
+        totals[key] = totals.get(key, 0) + _amount_of(e)
+    return [{"date": d, "amount": a, "source": s}
+            for (d, s), a in sorted(totals.items())]
+
+
+# 哪些触发方式留下的记录算「今天真实跑过签到」。
+# 体检（health）是接入校验、积分刷新（refresh/page_load）只查余额，两者都会跑
+# 脚本拿到 ALREADY，但那是「账号此刻的现状」，不是今天的签到动作。若把它们计入，
+# 早上打开面板（后台刚刷新过积分）就会把四个平台全显示成「已签到」；反过来
+# 昨天的签到留在账本里，也会因为「最近一条是 ALREADY」被误判成今天的成绩。
+CHECKIN_TRIGGERS = ("schedule", "manual", "retry")
+
+# 状态核查（probe）：只读查询，不算签到动作，也不参与临期快照重建
+# （--status 不带 expiring，若按常规口径入账会把当天快照全标成失效）
+PROBE_TRIGGER = "probe"
+
+
 class Ledger:
     def __init__(self, db_path: Path):
         db_path = Path(db_path)
@@ -266,13 +304,19 @@ class Ledger:
                 "total_credits": rr.total_credits,
                 "streak_days": rr.streak_days,
                 "report": rr.report,
+                "signed_today": 1 if getattr(rr, "signed_today", False) else 0,
                 "raw": rr.raw,
                 "trigger": trigger,
                 "parse_ok": 1 if rr.parse_ok else 0,
             }
             self._next_id += 1
             self._log.append(row)
-            self._update_snapshots_locked(rr)
+            # 状态核查只回答「今天签没签」、不回报余额：让它参与快照重建会把今天
+            # 所有临期行标成失效（详见 _update_snapshots_locked）。但它若真领到了
+            # 积分（脚本没实现 --status、忽略参数照常签到），那就必须按真实签到
+            # 记账、连同 expiring 一起入账——丢一笔真领的分比多跑一次查询糟得多
+            if trigger != PROBE_TRIGGER or rr.result == "CLAIMED":
+                self._update_snapshots_locked(rr)
             self._save_locked()
 
     def _update_snapshots_locked(self, rr) -> None:
@@ -294,6 +338,8 @@ class Ledger:
         """
         if not rr.expiring and not (rr.parse_ok and rr.result in ("CLAIMED", "ALREADY")):
             return
+        # 先按 (date, source) 合并同一来源的多笔权益包，避免被下面的三元组判重吃掉
+        expiring = aggregate_expiring(rr.expiring)
         now = datetime.now().isoformat(timespec="seconds")
         today = datetime.now().strftime("%Y-%m-%d")
         base = rr.platform.removesuffix("_credits")
@@ -302,8 +348,7 @@ class Ledger:
                           if not (r["platform"] == base and r["date"] >= today)]
         self._snap = [r for r in self._snap
                       if not (r["platform"] == rr.platform and r["date"] > today)]
-        today_sources = {str(e.get("source", ""))
-                         for e in rr.expiring if str(e["date"]) == today}
+        today_sources = {e["source"] for e in expiring if e["date"] == today}
         if today_sources:
             self._snap = [r for r in self._snap
                           if not (r["platform"] == rr.platform and r["date"] == today
@@ -315,8 +360,8 @@ class Ledger:
                 r["live"] = 0
         existing = {(r["date"], r["amount"], r["source"])
                     for r in self._snap if r["platform"] == rr.platform}
-        for e in rr.expiring:
-            key = (str(e["date"]), int(e.get("amount", 0)), str(e.get("source", "")))
+        for e in expiring:
+            key = (e["date"], e["amount"], e["source"])
             if key in existing:
                 continue
             self._snap.append({"id": self._next_id, "platform": rr.platform,
@@ -344,11 +389,20 @@ class Ledger:
 
     # ---------- 查询（行均为 dict，支持 row["col"] 访问） ----------
 
-    def latest_per_platform(self) -> dict[str, dict]:
-        """每个平台最近一条日志（即当前状态）。"""
+    def latest_per_platform(self, exclude_probe: bool = False) -> dict[str, dict]:
+        """每个平台最近一条日志（即当前状态）。
+
+        exclude_probe：跳过状态核查（probe）留下的记录。核查只回答「今天签没签」、
+        不回报余额，拿它当余额/连续天数来源会显示成 0。唯一的例外是核查链路上真
+        领到积分的 CLAIMED 行——那是实打实的签到（脚本没实现 --status 时会出现），
+        它带着真实余额，排除掉反而丢数据。
+        """
         with self._lock:
             latest: dict[str, dict] = {}
             for row in self._log:   # id 单调递增，后写即最新
+                if (exclude_probe and row["trigger"] == PROBE_TRIGGER
+                        and row["result"] != "CLAIMED"):
+                    continue
                 latest[row["platform"]] = row
             return latest
 
@@ -357,6 +411,36 @@ class Ledger:
             rows = [r for r in self._log if r["ts"].startswith(today)]
             rows.sort(key=lambda r: r["ts"])
             return rows
+
+    def today_checkin_rows(self, today: str) -> dict[str, dict]:
+        """今天真正发生签到的平台 → 该平台今天最后一条签到记录（含失败）。
+
+        判定「今天有没有签到这一动作」，看两类证据：
+        - schedule/manual/retry 触发的运行（真实签到动作，含失败要示警）；
+        - 任何触发方式下的 CLAIMED——体检首跑也可能真实签到（_health_check 对
+          CLAIMED 连同 expiring 一起入账），这是真实领到了积分，应算已签；
+        - 任何触发方式下 signed_today=1 的记录——脚本明确声明「平台侧确认今天
+          已签」。用户在平台客户端/别的签到工具先签了，面板自己没跑过签到，但
+          平台已经给出今天的成绩，这就是今天的签到事实。
+        排除的是体检/积分刷新的 ALREADY（signed_today 未置位）：那只是「脚本
+        读到的账号现状」，可能是昨天签的、也可能只是查了下余额，不代表今天有
+        签到动作。计入它们正是「早上打开面板四个平台全显示已签到」故障的根源。
+        """
+        with self._lock:
+            latest: dict[str, dict] = {}
+            for row in self._log:
+                if not row["ts"].startswith(today):
+                    continue
+                if (row["trigger"] in CHECKIN_TRIGGERS
+                        or row["result"] == "CLAIMED"
+                        or int(row.get("signed_today") or 0) == 1):
+                    latest[row["platform"]] = row
+            return latest
+
+    def platforms_signed_today(self, today: str) -> set[str]:
+        """今天已有「已签」结论的平台名（成功类），供状态核查跳过重复查询。"""
+        return {name for name, row in self.today_checkin_rows(today).items()
+                if row["result"] in ("CLAIMED", "ALREADY")}
 
     def has_schedule_run_today(self, today: str) -> bool:
         """今天是否已有调度触发的签到记录（供调度器判重）。"""
@@ -401,14 +485,35 @@ class Ledger:
     def logs_csv(self) -> str:
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["时间", "平台", "脚本", "状态", "积分", "累计积分", "连续天数", "返回明细", "触发方式"])
+        w.writerow(["时间", "平台", "脚本", "状态", "积分", "累计积分", "连续天数",
+                    "返回明细", "触发"])
         for r in self.logs("all", limit=10000):
             w.writerow([r["ts"], r["platform"], r["script"], r["result"],
                         r["credit"] if r["credit"] is not None else "—",
                         r["total_credits"] if r["total_credits"] is not None else "—",
                         r["streak_days"] if r["streak_days"] is not None else "—",
-                        r["report"], r["trigger"]])
+                        r["report"], self._trigger_label(r)])
         return buf.getvalue()
+
+    @staticmethod
+    def _trigger_label(row: dict) -> str:
+        """触发列展示文案：隐藏积分源（*_credits）只查余额不签到，定时队列里
+        与签到脚本同记 trigger=schedule 无法区分，按平台名后缀先行分流；
+        与 web/app.js 运行日志表格的口径保持一致。"""
+        if row["platform"].endswith("_credits"):
+            return "积分查询"
+        trigger = row.get("trigger", "")
+        if trigger == "schedule":
+            return "定时签到"
+        if trigger == "retry":
+            return "自动补签"
+        if trigger == "health":
+            return "体检"
+        if trigger == "refresh":
+            return "积分刷新"
+        if trigger == "probe":
+            return "状态核查"
+        return "手动签到"
 
     def expiring_snapshots(self, live_only: bool = False) -> list[dict]:
         """临期快照。live_only=True 时只返回「今天及以后、且最近一次回报仍存在」

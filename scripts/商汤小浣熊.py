@@ -34,8 +34,14 @@ today_credit。连续天数只在首次确认入账的当天 +1（last_date 守�
     "report": "可读汇报",
     "today_credit": 100,
     "streak_days": 7,
-    "total_credits": 700
+    "total_credits": 700,
+    "signed_today": true   // 可选：平台侧确认今天已签（--status 只读查询带上）
   }
+
+`--status`：只读查询今日是否已签到——**只读账单**，不发任何发放/触发请求。
+账单里今日确有「每日积分发放 / 桌面端登录奖励」入账即视为今天已签。面板打开/
+切回时用它承认「你在小浣熊桌面端已经登录过、积分已到账」的到，免得卡片一直
+显示未签到。
 """
 
 from __future__ import annotations
@@ -64,14 +70,18 @@ DAILY_GRANT_EVENT = "每日积分发放"
 CHECKIN_EVENTS = (DAILY_GRANT_EVENT, "桌面端登录奖励")
 
 
-def _out(result: str, report: str, today: int, streak: int, total) -> dict:
-    return {
+def _out(result: str, report: str, today: int, streak: int, total,
+         signed_today: bool | None = None) -> dict:
+    out = {
         "result": result,
         "report": report,
         "today_credit": int(today),
         "streak_days": int(streak),
         "total_credits": int(total) if isinstance(total, (int, float)) else 0,
     }
+    if signed_today is not None:
+        out["signed_today"] = bool(signed_today)
+    return out
 
 
 def _today_bills(bills: dict, today: str) -> tuple[list[dict], int]:
@@ -211,6 +221,41 @@ def _run() -> dict:
     return _out("ALREADY", report, 0, state["streak_days"], total)
 
 
+def _status_probe() -> dict:
+    """只读查询今日是否已签：**只读账单**，不发发放/触发请求。
+
+    账单里今日确有「每日积分发放 / 桌面端登录奖励」入账，就是平台侧已经给了
+    今天的成绩——用户可能在桌面端登录过。查不到账单或今日无入账时不置
+    signed_today，宁可显示未签到，也不谎报。
+    """
+    state = rc.load_state()
+    today = time.strftime("%Y-%m-%d")
+    creds = rc.resolve_with_refresh()
+    if creds is None:
+        sources = [name for name, _p, _d in rc.credential_sources()]
+        where = "、".join(sources) if sources else "桌面端登录态与 auths/ 镜像"
+        return _out("NO_AUTH", f"未找到小浣熊登录凭据（{where} 均无）",
+                    0, state["streak_days"], state["last_total"])
+
+    bills, status, err = rc.api_json("GET", PATH_BILLS, creds["access"],
+                                     timeout=BILLS_TIMEOUT)
+    if bills is None:
+        if status == 401:
+            return _out("NO_AUTH", "账单查询被拒绝（HTTP 401），请重新登录小浣熊桌面端",
+                        0, state["streak_days"], state["last_total"])
+        result = "NETWORK" if status in (-1, 429, 502, 503, 504) else "ERROR"
+        return _out(result, f"账单查询失败：{err}",
+                    0, state["streak_days"], state["last_total"])
+
+    grants, _other = _today_bills(bills, today)
+    signed = bool(grants)
+    daily = sum(g["points"] for g in grants if g["name"] == DAILY_GRANT_EVENT)
+    report = ("平台确认今日已签到" + (f"（+{daily} 积分）" if daily else "")
+              if signed else "账单显示今天尚未有签到积分入账")
+    return _out("ALREADY", report, 0, state["streak_days"], state["last_total"],
+                signed_today=signed)
+
+
 def _refresh_only() -> dict:
     """纯凭据刷新：校验/续期登录态，不执行签到。"""
     state = rc.load_state()
@@ -228,7 +273,12 @@ def _refresh_only() -> dict:
 
 
 def main() -> int:
-    out = _refresh_only() if "--refresh" in sys.argv else _run()
+    if "--status" in sys.argv:
+        out = _status_probe()
+    elif "--refresh" in sys.argv:
+        out = _refresh_only()
+    else:
+        out = _run()
     print(json.dumps(out, ensure_ascii=False))
     if out["result"] in ("CLAIMED", "ALREADY"):
         return 0

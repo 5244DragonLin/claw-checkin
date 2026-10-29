@@ -115,10 +115,15 @@ def _state_candidates() -> list[str]:
 def load_state(default: dict | None = None) -> dict:
     """读取积分状态，自动合并同步盘冲突副本（取 last_date 最新的记录）。
 
-    state 只有三个数（total_credits/streak_days/last_date），轮流使用下取
-    「最新签到日」的那份即是权威；合并后删除冲突副本，避免无限堆积。
+    state 只有几个数（total_credits/streak_days/last_date/last_daily，以及活动
+    福利的 activity_date/activity_credit），轮流使用下取「最新签到日」的那份即是
+    权威；合并后删除冲突副本，避免无限堆积。
+
+    注意 base 同时是「允许写回哪些键」的白名单：新增字段必须在这里登记，
+    否则读回来会被过滤掉（表现为脚本每次都当成「今天还没记过账」而重复计入）。
     """
-    base = {"total_credits": 0, "streak_days": 0, "last_date": "", "last_daily": 0}
+    base = {"total_credits": 0, "streak_days": 0, "last_date": "", "last_daily": 0,
+            "activity_date": "", "activity_credit": 0}
     if isinstance(default, dict):
         base.update(default)
     best, best_key = None, ("", -1, -1)

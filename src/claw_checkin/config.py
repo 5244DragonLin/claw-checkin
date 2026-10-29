@@ -36,6 +36,13 @@ class CreditsConfig:
 
 
 @dataclass
+class ProbeConfig:
+    """状态核查：只读查询「今天在平台侧签过没有」，用于承认别处签的到。"""
+    enabled: bool = True
+    debounce: int = 30            # 同一台机器两次核查的最小间隔（秒），0 关闭防抖
+
+
+@dataclass
 class LedgerConfig:
     db: str = "data/ledger.json"  # 账本（单文件 JSON，同步盘友好；旧 .db 配置自动兼容）
     retention_days: int = 30      # 日志本地保留天数
@@ -54,6 +61,7 @@ class AppConfig:
     scripts: ScriptsConfig = field(default_factory=ScriptsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     credits: CreditsConfig = field(default_factory=CreditsConfig)
+    probe: ProbeConfig = field(default_factory=ProbeConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -73,6 +81,7 @@ _DEFAULTS = {
     "scripts": {"dir": "scripts", "timeout": 120},
     "schedule": {"enabled": True, "time": "10:30"},
     "credits": {"refresh_interval": 300, "page_load_debounce": 30},
+    "probe": {"enabled": True, "debounce": 30},
     "ledger": {"db": "data/ledger.json", "retention_days": 30,
                "snapshot_retention_days": 31},
     "logging": {"level": "INFO", "file": ""},

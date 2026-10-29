@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from claw_checkin.config import AppConfig, PROJECT_ROOT, load_config
-from claw_checkin.ledger import Ledger
+from claw_checkin.ledger import PROBE_TRIGGER, Ledger, aggregate_expiring
 from claw_checkin.runner import health_check, run_script
 from claw_checkin.scanner import build_command, scan_scripts
 from claw_checkin.scheduler import DailyScheduler
@@ -77,7 +77,7 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
                 return None      # 浏览器 F5 连点：防抖窗口内不重复跑脚本
             _last_refresh[0] = now
             results = []
-            latest = ledger.latest_per_platform()
+            latest = ledger.latest_per_platform(exclude_probe=True)
             snap_now: dict[str, list] = {}
             # 用实时口径（今天及以后 + 接口仍持有）比对：失效行不算变化，
             # 否则每次刷新都会因「历史行集合」差异反复落盘
@@ -89,8 +89,11 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
                     continue
                 try:
                     rr = run_script(s.name, s.path, build_command(s), cfg.scripts.timeout)
-                    exp_new = sorted((str(e.get("date", "")), int(e.get("amount", 0)),
-                                      str(e.get("source", ""))) for e in rr.expiring)
+                    # 与快照同一套 (date, source) 合并口径：原始回报里同来源的多笔
+                    # 权益包进快照时会合并，直接拿原始明细比对会永远「有变化」
+                    exp_new = sorted(
+                        (e["date"], e["amount"], e["source"])
+                        for e in aggregate_expiring(rr.expiring))
                     prev = latest.get(s.name)
                     changed = (prev is None
                                or rr.result != prev["result"]
@@ -108,6 +111,86 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
             return results
         finally:
             _refresh_lock.release()
+
+    # 状态核查（`--status` 只读查询）单独一把锁：它跑的是签到脚本本身，
+    # 与积分源刷新互不干扰，也不该被积分刷新的锁卡住
+    _probe_lock = threading.Lock()
+    _last_probe = [0.0]
+    # 是否有核查正在进行。首屏渲染据此把尚未有结论的平台标成「核查中」而不是
+    # 「未签到」——启动时的后台核查要跑几个平台，这几秒里账本还没有今天的事实，
+    # 直接把「没有结论」画成「未签到」就是谎报（本次故障的观感来源）
+    _probing = [False]
+    # 页面核查等待在跑那一轮的预算（秒）：启动时的后台核查要跑几个平台、
+    # 每个一次 HTTP 往返，页面正好在这期间打开时，等它跑完再回话，比直接
+    # 回答「有人正在查」有用得多——后者会让卡片停在「未签到」直到下轮轮询。
+    # 不必太长：真等到超时也只是回 busy，前端会重试，不丢结论
+    PROBE_WAIT_BUDGET = 10.0
+
+    def _probe_status_once(trigger: str = "page_load",
+                           wait: bool = False) -> tuple[list[dict] | None, str]:
+        """只读核查各平台「今天在平台侧签过没有」，承认在别处签的到。
+
+        背景：面板默认只承认自己触发的签到动作（schedule/manual/retry）。用户
+        在平台客户端或别的签到工具先签了，面板无从得知，卡片会一直显示「未签到」。
+        这里让脚本以 `--status` 只读查询平台的今日状态，脚本确认「今天已签」时
+        输出 signed_today=true，面板据此把卡片标成已签到。
+
+        三条纪律：
+        - 只登记「已签」这一个结论。查不到/未签/凭据失效都不写账本——不写就等于
+          「没有证据」，卡片照旧显示未签到，不会把猜测写成事实；
+        - 例外是脚本没实现 --status、忽略参数真的领到了积分（CLAIMED）：那是实打实
+          的签到，必须照常入账，宁可多记一笔也不让真领的分消失；
+        - 平台今天已有已签结论时直接跳过，不重复劳烦上游；
+        - 只有 scripts/_meta.json 的 status_probe 名单里的脚本才会被这么调用：
+          不认识 --status 的脚本通常会忽略参数、照常签到，自动探测等于替用户
+          多点一次签到。
+
+        返回 (结果列表, 原因)：结果为 None 表示本次没跑脚本，原因说明为什么——
+        - "ran"      真的跑了（第一个元素是各平台结论，可能为空列表）
+        - "debounce" 刚查过，防抖窗口内不重复查；账本已是最新结论，调用方只需重拉数据
+        - "busy"     另一轮核查正在跑且等到超预算还没结束
+
+        wait=True 时先等在跑的那一轮收工（最多 PROBE_WAIT_BUDGET 秒）：启动线程
+        正在核查时页面打开，就是靠这个等到结论，而不是空手返回。
+        """
+        if wait:
+            got = _probe_lock.acquire(timeout=min(PROBE_WAIT_BUDGET,
+                                                 float(cfg.scripts.timeout)))
+        else:
+            got = _probe_lock.acquire(blocking=False)
+        if not got:
+            return None, "busy"
+        _probing[0] = True
+        try:
+            now = time.monotonic()
+            if (trigger == "page_load"
+                    and now - _last_probe[0] < cfg.probe.debounce):
+                # 页面连点/多标签页，或刚等到别人查完：不重复查，账本已是最新
+                return None, "debounce"
+            _last_probe[0] = now
+            today = datetime.now().strftime("%Y-%m-%d")
+            signed = ledger.platforms_signed_today(today)
+            results = []
+            for s in _visible():
+                if not s.probe or s.name in signed:
+                    continue
+                try:
+                    rr = run_script(s.name, s.path,
+                                    build_command(s, status=True), cfg.scripts.timeout)
+                except Exception as e:      # 核查失败不影响面板，也不写账本
+                    log.warning("状态核查失败 %s：%s", s.name, e)
+                    continue
+                if rr.signed_today or rr.result == "CLAIMED":
+                    ledger.insert_run(rr, trigger=PROBE_TRIGGER)
+                    log.info("状态核查 %s → %s", s.name,
+                             "平台确认今日已签" if rr.signed_today else "核查链路真实签到")
+                results.append({"platform": s.name, "result": rr.result,
+                                "signed_today": rr.signed_today,
+                                "report": rr.report})
+            return results, "ran"
+        finally:
+            _probing[0] = False
+            _probe_lock.release()
 
     class _CreditRefresher:
         """按固定间隔后台刷新积分余额（消耗积分后无需重启面板即可见最新值）。"""
@@ -134,6 +217,10 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
+        # 启动先核查一次「今天在平台侧签过没有」：这样即便用户是在平台客户端
+        # 签的、之后才打开面板，卡片一开始就是已签到
+        threading.Thread(target=lambda: _probe_status_once("refresh"),
+                         daemon=True, name="status-probe").start()
         threading.Thread(target=_refresh_credits_once, args=("refresh",),
                          daemon=True, name="credit-refresh").start()
         refresher = _CreditRefresher(cfg.credits.refresh_interval)
@@ -234,7 +321,15 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
         today = datetime.now().strftime("%Y-%m-%d")
         all_scripts = _discovered()
         scripts = _visible()   # 平台列表只展示可见平台（隐藏子功能不展示）
-        latest = ledger.latest_per_platform()
+        # 余额/连续天数取最近一条「带数据」的记录：状态核查（probe）只回答今天
+        # 签没签、不回报余额，拿它当来源会把卡片上的积分/连续天数显示成 0
+        latest = ledger.latest_per_platform(exclude_probe=True)
+        # 今天真实发生签到的记录（schedule/manual/retry、体检首跑真实领分，以及
+        # 状态核查确认「平台侧今天已签」）。卡片上的「今日已签」必须来自它：
+        # latest_per_platform 里躺着的可能是昨天的签到、或刚被体检/积分刷新写进去的
+        # ALREADY，拿它判断状态会让早晨刚打开面板时四个平台全显示「已签到」，
+        # 与下方「立即签到」按钮打架。
+        today_checkins = ledger.today_checkin_rows(today)
         # 隐藏的积分源平台（如 workbuddy_credits）为对应签到平台提供"总积分"展示口径
         credit_source = {}
         visible_names = {s.name for s in scripts}
@@ -254,10 +349,18 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
         for s in scripts:
             row = latest.get(s.name)
             h = _health_of(s.name)
-            status = row["result"] if row else "PENDING"   # 今日未跑
-            # 今日已签：今天有该平台的成功记录
-            today_ok = bool(row and row["ts"].startswith(today)
-                            and row["result"] in ("CLAIMED", "ALREADY"))
+            # 「今日已签」只看今天真实发生的签到（schedule/manual/retry，含体检
+            # 首跑真实领分的 CLAIMED）：latest 里的 ALREADY 可能是昨天的，也可能
+            # 只是体检/积分刷新顺带写下的，不能作为今天的成绩
+            today_row = today_checkins.get(s.name)
+            today_ok = bool(today_row and today_row["result"] in ("CLAIMED", "ALREADY"))
+            # 徽章状态：优先今天的真实签到结论；今天没跑过签到时显示「未签到」，
+            # 不把昨天/体检/刷新留下的旧 ALREADY 误报成今天的成绩。
+            # 此刻若核查正在跑（启动后的头几秒），对该平台来说结论还没出来——
+            # 标成 PROBING 让前端显示「核查中」，而不是先把「没有结论」画成
+            # 「未签到」再翻牌（2026-10-29 的观感故障）
+            status = today_row["result"] if today_row else "PENDING"
+            probing = bool(_probing[0] and s.probe and not today_row)
             # 积分源余额优先；无积分源时回退签到脚本自己的 total_credits；
             # 两者都没有（如刚清空日志但积分源已刷新）才置 0
             if s.name in credit_source:
@@ -283,9 +386,10 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
                 **s.to_dict(),
                 "status": status,
                 "today_ok": today_ok,
+                "probing": probing,     # 核查进行中：前端显示「核查中」而非「未签到」
                 "credits": credits,
                 "streak": streak,
-                "report": row["report"] if row else "",
+                "report": today_row["report"] if today_row else (row["report"] if row else ""),
                 "health": h["overall"] if h else "未体检",
                 "expiring_14d": exp_total,
                 "has_expiring": has_expiring,
@@ -476,6 +580,32 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
             return {"ran": 0, "ok": 0, "results": [], "skipped": True}
         return {"ran": len(results), "ok": sum(1 for r in results if r["ok"]),
                 "results": results, "skipped": False}
+
+    @app.post("/api/check_status")
+    def api_check_status(source: str = "page_load"):
+        """只读核查「今天在平台侧签过没有」，承认在别处签的到。
+
+        source=page_load：前端整页加载 / 切回前台时自动触发，防抖窗口内跳过；
+        其余取值（按钮）只做并发保护，不防抖。
+
+        返回 skipped=True 时带 reason 说明原因，前端据此决定要不要重试：
+        - "debounce"：刚查过（防抖窗口内），账本已是最新结论，重拉数据即可
+        - "busy"：另一轮核查仍在跑，稍后重试
+        """
+        if not cfg.probe.enabled:
+            return {"ran": 0, "signed": 0, "results": [], "skipped": True,
+                    "reason": "disabled", "disabled": True}
+        trigger = "page_load" if source == "page_load" else "manual"
+        # 页面触发的核查允许等在跑的那一轮：启动时后台已经开始查，浏览器此时
+        # 打开页面正好撞上，等它跑完就能一次把「已签到」画出来，不必等 60 秒轮询
+        results, reason = _probe_status_once(trigger, wait=(trigger == "page_load"))
+        if results is None:
+            return {"ran": 0, "signed": 0, "results": [], "skipped": True,
+                    "reason": reason, "disabled": False}
+        return {"ran": len(results),
+                "signed": sum(1 for r in results if r["signed_today"]),
+                "results": results, "skipped": False, "reason": reason,
+                "disabled": False}
 
     @app.post("/api/refresh/{name}")
     def api_refresh(name: str):

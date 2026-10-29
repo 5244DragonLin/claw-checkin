@@ -5,6 +5,17 @@
 读取唯一凭证文件 auths/autoclaw.json（兼容旧名 autoclaw-cn.json），调用签到 API
 POST {基址}/autoclaw-proxy/proxy/autoclaw-task-complete
 
+签到只给每日签到那一份（当前 200 积分）。客户端启动时还能拿到一笔运营活动奖励
+（当前「用户登录奖励 500 积分，7 天有效」），它不在任务列表里、也没有领取接口：
+
+  1. POST /userapi/v1/user-info —— 官方客户端每次启动都会打这个触点，服务端据此
+     判定用户活跃并按活动规则发奖（必须 POST，GET 同路径返回 code=404）；
+  2. GET /agent-assetmgr/api/v1/ledgers_std（只看收入方向）—— 活动奖励没有领取
+     接口可调，只能读流水复核当天到账多少。
+
+因此本脚本的「今日收益」= 签到奖励 + 当日活动奖励，两者都只在首次确认到账的那
+一跑计入 today_credit（state 里 activity_date 守住，同日重复执行不双计）。
+
 token 自动提取（优先级）：
   1. AutoClaw 2 桌面端：解密 %APPDATA%/AutoClaw-official/accounts/*/account-credentials.enc
      （Chromium os_crypt：DPAPI 保护的 AES-256-GCM 密钥，仅 Windows，需 cryptography 包）；
@@ -20,8 +31,13 @@ token 自动提取（优先级）：
     "report": "可读汇报",
     "today_credit": 100,
     "streak_days": 0,
-    "total_credits": 0
+    "total_credits": 0,
+    "signed_today": true   // 可选：平台侧确认今天已签（--status 只读查询带上）
   }
+
+`--status`：只读查询今天签没签（GET autoclaw-task-list 看 daily_signin 是否
+completed），**不发签到请求、不领积分**。面板打开/切回时用它承认「你在 AutoClaw
+客户端已经签过」的到，免得卡片一直显示未签到。
 
 凭证文件格式（autoclaw.json）：
   { "accessToken": "...", "region": "cn|global" }
@@ -53,7 +69,21 @@ USERAPI_BASE = {
     "global": "https://autoglm-api.autoglm.ai",
 }
 PATH_TASK_COMPLETE = "/autoclaw-proxy/proxy/autoclaw-task-complete"
+# 只读任务列表：能查到 daily_signin 的完成状态，用于 `--status`
+PATH_TASK_LIST = "/autoclaw-proxy/proxy/autoclaw-task-list"
+# 「登录」触点：官方客户端每次启动都会打一次，服务端据此判定用户活跃并发放
+# 运营活动奖励（当前是「用户登录奖励积分 500，7 天有效」）。必须 POST（GET 同
+# 路径返回 code=404），body 传空对象即可
+PATH_USER_INFO = "/userapi/v1/user-info"
+# 积分流水（只读）：活动奖励是「事件发奖」，没有领取接口，只能读流水复核到账
+PATH_LEDGERS = "/agent-assetmgr/api/v1/ledgers_std"
+LEDGERS_QUERY = ("?asset_type=point&wallet_type=all&cursor=&page_size=50"
+                 "&flow_direction=income")
+# 活动奖励在流水里的标识：metadata.activity_id 以它开头，或 metadata.event_type 等于它
+ACTIVITY_PREFIX = "autoclaw_user_active"
 REQUEST_TIMEOUT = 20
+# user-info 触发后奖励可能晚一个心跳到账：读流水拿不到时补读一次，间隔 1.2 秒
+ACTIVITY_RETRY_DELAY = 1.2
 
 # 自动探测 ClawCheckin 项目根下的 auths/ 目录，也支持环境变量覆盖
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -423,6 +453,81 @@ def _http_json(method: str, url: str, token: str, body: dict | None) -> tuple:
         return None, status, raw.decode("utf-8", "replace")[:300]
 
 
+def _out(result: str, report: str, today: int = 0, streak: int = 0,
+         total: int = 0, signed_today: bool | None = None) -> dict:
+    out = {
+        "result": result,
+        "report": report,
+        "today_credit": int(today),
+        "streak_days": int(streak),
+        "total_credits": int(total),
+    }
+    if signed_today is not None:
+        out["signed_today"] = bool(signed_today)
+    return out
+
+
+def _task_completed(row: dict) -> bool:
+    """判定任务行是否「今天已完成」。
+
+    上游实测（2026-10）用 `status: "completed" | "incomplete"` 表达状态，
+    **不是** `completed: true` 布尔（该字段已废弃、实测恒为 None）。早期照抄
+    参考实现只认布尔，导致「平台明明显示已签到、面板却报未签到」的静默误报。
+    两种形态都认，并兼容大写与常见同义值。
+    """
+    status = str(row.get("status") or "").strip().lower()
+    if status in ("completed", "complete", "done", "claimed", "finished"):
+        return True
+    if status in ("incomplete", "pending", "todo", "uncompleted"):
+        return False
+    # status 缺失/不可识别时退回旧布尔字段（老版本接口可能只有它）
+    legacy = row.get("completed")
+    if isinstance(legacy, bool):
+        return legacy
+    return False
+
+
+def _status_probe(acct: dict | None, state: dict) -> dict:
+    """只读查询今日是否已签：拉任务列表看 daily_signin 的状态。
+
+    绝不调用 task-complete（那个会真的领积分）。只有列表明确表示「已完成」才置
+    signed_today——列表拿不到、结构不认识都按「没有证据」处理，宁可让卡片显示
+    未签到，也不谎报已签。
+    """
+    if not acct:
+        return _out("NO_AUTH", "未找到 AutoClaw 凭据，请先登录 AutoClaw 桌面端")
+    base = USERAPI_BASE.get(acct["region"], USERAPI_BASE["cn"])
+    payload, status, err = _http_json("GET", base + PATH_TASK_LIST, acct["token"], None)
+    if payload is None:
+        if status == -1:
+            return _out("NETWORK", f"任务列表查询失败：{err}")
+        if status in (401, 403):
+            return _out("NO_AUTH", f"任务列表查询被拒绝（HTTP {status}），请重新登录 AutoClaw")
+        return _out("NETWORK" if status in (429, 502, 503, 504) else "ERROR",
+                    f"任务列表查询失败（HTTP {status}）：{err}")
+    if not isinstance(payload, dict) or payload.get("code") not in (0, None):
+        return _out("ERROR", f"任务列表返回异常：{str(payload)[:120]}")
+    tasks = payload.get("data")
+    if not isinstance(tasks, list):
+        return _out("ERROR", "任务列表结构不可识别")
+
+    row = next((t for t in tasks
+                if isinstance(t, dict) and t.get("task_id") == TASK_ID), None)
+    if row is None:
+        return _out("ALREADY", "任务列表里没有每日签到任务，可能今日未开放")
+    done = _task_completed(row)
+    # 平台给了「已签到 N 天」这样的可读状态，优先照搬，比自造文案可信
+    desc = str(row.get("status_description") or "").strip()
+    if done:
+        report = "平台确认今日已签到" + (f"（{desc}）" if desc else "")
+    else:
+        report = "平台显示今天尚未签到" + (f"（{desc}）" if desc else "")
+    return _out("ALREADY", report,
+                streak=state.get("streak_days", 0),
+                total=state.get("total_credits", 0),
+                signed_today=done)
+
+
 def _checkin_api(acct: dict) -> dict:
     """对单个 AutoClaw 账号执行签到，返回原始结果。"""
     base = USERAPI_BASE.get(acct["region"], USERAPI_BASE["cn"])
@@ -484,8 +589,83 @@ def _checkin_api(acct: dict) -> dict:
     return result
 
 
+def _trigger_login(acct: dict) -> str:
+    """冒充一次「用户登录」，让服务端判定用户活跃并发放当天的运营活动奖励。
+
+    这是官方客户端启动时打的同一个触点（POST /userapi/v1/user-info，空 body）。
+    与签到无关、也不是领取接口：奖励由服务端按活动规则发，这里只负责把「用户
+    活跃」这个事件打出去。返回空串表示成功，否则返回一句可读的失败原因——
+    调用方只把它写进汇报，不影响签到本身的结论。
+
+    幂等：服务端按 grant_date 每天只发一次，重复调用不会重复加分；出错也不抛。
+    """
+    base = USERAPI_BASE.get(acct["region"], USERAPI_BASE["cn"])
+    payload, status, err = _http_json("POST", base + PATH_USER_INFO, acct["token"], {})
+    if payload is None:
+        return err if status == -1 else f"HTTP {status}：{err}"
+    if not isinstance(payload, dict):
+        return f"响应非 JSON：{str(payload)[:80]}"
+    if payload.get("code") not in (0, None):
+        return str(payload.get("msg") or f"code={payload.get('code')}")
+    return ""
+
+
+def _activity_today(acct: dict, today: str) -> tuple:
+    """读当日入账流水，汇总运营活动发的积分。返回 (合计, 明细文案列表)。
+
+    只读，不产生任何副作用。活动奖励在流水里长这样：
+
+        amount 500, source campaign, wallet_scope campaign
+        description "AutoClaw 用户登录奖励积分，7天有效"
+        metadata.activity_id  = autoclaw_user_active_reward_202609
+        metadata.event_type   = autoclaw_user_active
+        metadata.grant_date   = "2026-10-23"
+
+    筛选口径：金额为正 + 属于 autoclaw_user_active 活动 + grant_date 是今天。
+    没有 grant_date 的老记录退回按 occurred_at 的日期判。每日签到（description
+    为「每日签到」）不带这些字段，不会被算进来。
+    """
+    base = USERAPI_BASE.get(acct["region"], USERAPI_BASE["cn"])
+    payload, _status, _err = _http_json("GET", base + PATH_LEDGERS + LEDGERS_QUERY,
+                                        acct["token"], None)
+    if not isinstance(payload, dict) or payload.get("code") not in (0, None):
+        return 0, []
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        return 0, []
+
+    total = 0
+    details = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            amount = int(entry.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        meta = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        activity_id = str(meta.get("activity_id") or "")
+        event_type = str(meta.get("event_type") or "")
+        if not (activity_id.startswith(ACTIVITY_PREFIX) or event_type == ACTIVITY_PREFIX):
+            continue
+        # grant_date 是发奖日（服务端按它去重），比 occurred_at 更能代表「哪一天的份额」
+        grant_date = str(meta.get("grant_date") or "")[:10]
+        day = grant_date or str(entry.get("occurred_at") or "")[:10]
+        if day != today:
+            continue
+        total += amount
+        desc = str(entry.get("description") or "").strip()
+        details.append(f"{desc or '活动奖励'} +{amount}")
+
+    return total, details
+
+
 def main():
     refresh_only = "--refresh" in sys.argv
+    status_only = "--status" in sys.argv
 
     state = _load_state()
     today = time.strftime("%Y-%m-%d")
@@ -497,6 +677,11 @@ def main():
     _refresh_from_autoclaw2(auth_dir)
 
     acct = _load_auth(auth_dir)
+
+    if status_only:
+        out = _status_probe(acct, state)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if out["result"] in ("CLAIMED", "ALREADY") else 1
 
     if refresh_only:
         if acct:
@@ -535,6 +720,32 @@ def main():
     if today_points > 0 and state.get("last_date") != today:
         state["streak_days"] = state.get("streak_days", 0) + 1
         state["last_date"] = today
+
+    # 活动福利：签到之外还有一笔运营活动奖励（当前是「用户登录奖励 500 积分，
+    # 7 天有效」）。它不在任务列表里、也没有领取接口——只能先打一次「登录」触点
+    # 把用户活跃事件发出去，再由服务端按活动规则发奖，我们读流水复核到账。
+    # 同一天只入账一次（activity_date 守卫，跨机共用同一份 state 也不双计）；
+    # 这一步失败只写进汇报，不改变签到本身的结论。
+    activity_sum = 0
+    activity_note = ""
+    if r["ok"] and state.get("activity_date") != today:
+        trigger_err = _trigger_login(acct)
+        activity_sum, activity_details = _activity_today(acct, today)
+        if activity_sum == 0 and not trigger_err:
+            time.sleep(ACTIVITY_RETRY_DELAY)
+            activity_sum, activity_details = _activity_today(acct, today)
+        if activity_sum > 0:
+            state["activity_date"] = today
+            state["activity_credit"] = activity_sum
+            state["total_credits"] = state.get("total_credits", 0) + activity_sum
+            joined = "、".join(activity_details) if activity_details else f"+{activity_sum}"
+            activity_note = f"；活动福利 {joined} 已到账"
+        elif trigger_err:
+            activity_note = f"；活动福利未触发（{trigger_err}）"
+    elif r["ok"] and state.get("activity_credit"):
+        # 今天早先那一跑已经记过账，这里只做陈述、不再计入 today_credit
+        activity_note = f"；今日活动福利 +{state['activity_credit']} 已到账"
+
     _save_state(state)
     # 展示口径：签到接口余额 > 本地累计
     total = r["balance"] if r["balance"] is not None else state.get("total_credits", 0)
@@ -558,11 +769,12 @@ def main():
         if r["balance"] is not None:
             r["report"] += f"，余额 {r['balance']} 积分"
 
-    # 签到成功
+    # 签到成功。today_credit 报「这一跑实际新增到账」（签到 + 活动福利），
+    # 已签到场景下签到部分归 0，与既有口径一致
     print(json.dumps({
         "result": "ALREADY" if r["already_completed"] else "CLAIMED",
-        "report": r["report"],
-        "today_credit": 0 if r["already_completed"] else today_points,
+        "report": r["report"] + activity_note,
+        "today_credit": (0 if r["already_completed"] else today_points) + activity_sum,
         "streak_days": state["streak_days"],
         "total_credits": total,
     }, ensure_ascii=False))

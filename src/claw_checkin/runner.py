@@ -7,8 +7,14 @@
   "today_credit": 100,
   "streak_days": 7,
   "total_credits": 700,
-  "expiring": [ { "date": "2026-09-25", "amount": 320, "source": "每日签到" } ]  # 可选
+  "expiring": [ { "date": "2026-09-25", "amount": 320, "source": "每日签到" } ],  # 可选
+  "signed_today": true            # 可选：平台侧确认「今天确实已签」
 }
+
+signed_today 的意义：面板默认只承认自己触发的签到动作。用户在平台客户端（或
+别的签到工具）先签了，面板无从得知，只能显示「未签到」。脚本在**确有证据**
+（平台返回今日已签/今日已领取）时置 true，面板据此把卡片标成已签到；
+拿不准就不填——填错会让面板谎报，比显示未签到更糟。
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ class RunResult:
     streak_days: int | None = None
     total_credits: int | None = None
     expiring: list = field(default_factory=list)
+    signed_today: bool = False       # 平台侧确认今日已签（见模块说明）
     raw: str = ""                    # stdout 原文
     parse_ok: bool = False
     error: str = ""                  # 执行/解析失败原因
@@ -54,6 +61,7 @@ class RunResult:
             "streak_days": self.streak_days,
             "total_credits": self.total_credits,
             "expiring": self.expiring,
+            "signed_today": self.signed_today,
             "raw": self.raw,
             "parse_ok": self.parse_ok,
             "error": self.error,
@@ -109,6 +117,9 @@ def run_script(platform: str, path, command: list[str], timeout: int = 120) -> R
         exp = data.get("expiring")
         if isinstance(exp, list):
             rr.expiring = [e for e in exp if isinstance(e, dict) and e.get("date")]
+        # 只认明确的布尔真值：字符串 "false"、0、缺失都按「没有证据」处理，
+        # 不能让脏字段把平台谎报成已签到
+        rr.signed_today = data.get("signed_today") is True
         if rr.result not in RESULT_ENUM:
             rr.result = "ERROR"
             rr.error = f"result 取值越界：{rr.result!r}（六枚举之外）"
@@ -137,10 +148,21 @@ def health_check(info: ScriptInfo, timeout: int = 120) -> dict:
     cmd = build_command(info)
     first = run_script(info.name, info.path, cmd, timeout)
 
+    # 可执行性只看「跑得动、吐得出合法契约」，不要求这次真的签到成功。
+    # 脚本对未成功的结果一律返回非 0 退出码（1/2），那属于业务结论，由
+    # 「枚举合规」体现；否则凭据没就绪时会被误判成「脚本跑不动」。
+    contract_ok = first.parse_ok and first.result in RESULT_ENUM
+    if first.returncode == 0:
+        exec_detail = f"退出码 {first.returncode}"
+    elif contract_ok:
+        exec_detail = f"退出码 {first.returncode}（{first.result}，契约合法）"
+    else:
+        exec_detail = f"退出码 {first.returncode}"
+
     checks = [
-        {"name": "可执行性", "desc": "脚本跑得动、就算已安装、退出码为 0",
-         "status": "pass" if first.returncode == 0 else "fail",
-         "detail": f"退出码 {first.returncode}"},
+        {"name": "可执行性", "desc": "脚本跑得动、能吐出符合契约的结果",
+         "status": "pass" if (first.returncode == 0 or contract_ok) else "fail",
+         "detail": exec_detail},
         {"name": "输出合法", "desc": "stdout 末行是可解析的单行 JSON",
          "status": "pass" if first.parse_ok else "fail",
          "detail": "已解析" if first.parse_ok else "末行非 JSON"},
@@ -159,14 +181,14 @@ def health_check(info: ScriptInfo, timeout: int = 120) -> dict:
         checks[3]["status"] = "pass" if first.result in RESULT_ENUM and first.result != "ERROR" else "fail"
         checks[3]["detail"] = first.result
 
-        # 双跑验证
-        if first.returncode == 0 and not missing:
+        # 双跑验证：只有首次确实领到或确认已领（CLAIMED/ALREADY）才谈得上幂等，
+        # 与退出码无关（脚本的退出码表达业务结论，不表达「能不能跑」）
+        if not missing and first.result in OK_RESULTS:
             import time
             time.sleep(0.5)
             second = run_script(info.name, info.path, cmd, timeout)
             idempotent = (
-                second.returncode == 0
-                and second.result == "ALREADY"
+                second.result == "ALREADY"
                 and second.total_credits == first.total_credits
             )
             checks[4]["status"] = "pass" if idempotent else "fail"
@@ -176,6 +198,9 @@ def health_check(info: ScriptInfo, timeout: int = 120) -> dict:
                 else f"第二次返回 {second.result or '无输出'}"
                 + ("" if second.total_credits == first.total_credits else "，积分发生变化")
             )
+        elif not missing:
+            checks[4]["status"] = "skip"
+            checks[4]["detail"] = f"首次返回 {first.result}，待首次真实签到后补验"
         else:
             checks[4]["status"] = "skip"
             checks[4]["detail"] = "前置项未通过，跳过"

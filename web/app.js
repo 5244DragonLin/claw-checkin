@@ -7,6 +7,7 @@ const PLATFORM_ICON = {
   autoclaw: "/static/icons/autoclaw.png",
   商汤小浣熊: "/static/icons/raccoon.png",
   qoder: "/static/icons/qoder.png",
+  trae: "/static/icons/trae.png",
 };
 // 日志/卡片展示名：隐藏积分源（*_credits）与主平台脚本归一到同一平台名，
 // 不带「积分」后缀，避免运行日志里同一平台出现两种叫法。
@@ -21,6 +22,7 @@ const DISPLAY_NAMES = {
   raccoon_credits: "商汤小浣熊",
   qoder: "Qoder",
   qoder_credits: "Qoder",
+  trae: "Trae",
 };
 const displayName = (name) => DISPLAY_NAMES[name] || name;
 const iconFor = (name) => {
@@ -99,8 +101,11 @@ async function api(path, opts) {
   }
   return res.json();
 }
-function badge(status, todayOk) {
+function badge(status, todayOk, probing) {
   if (todayOk) return '<span class="badge ok">已签到</span>';
+  // 核查进行中：结论还没出来，先说「核查中」。把它画成「未签到」就是谎报——
+  // 用户在别处签过的话，一两秒后就会变绿（2026-10-29 的观感故障）
+  if (probing) return '<span class="badge gray">核查中…</span>';
   if (status === "PENDING" || !status) return '<span class="badge pending">未签到</span>';
   if (status === "CLAIMED" || status === "ALREADY") return '<span class="badge ok">已签到</span>';
   if (status === "NO_AUTH") return '<span class="badge warn">待验证</span>';
@@ -128,7 +133,7 @@ async function loadOverview(silent = false) {
     const data = await api("/api/overview");
     // 数据未变则整段跳过渲染，避免无谓的 DOM 重写（重写同样会造成闪动）
     const fp = JSON.stringify([data.platforms.map((p) => [p.name, p.status, p.credits,
-      p.streak, p.expiring_14d, p.today_ok]), data.total_credits, data.expiring_14d,
+      p.streak, p.expiring_14d, p.today_ok, p.probing]), data.total_credits, data.expiring_14d,
       data.done_count, data.today]);
     if (quiet && fp === ovFingerprint) return;
     renderOverview(data);
@@ -180,7 +185,7 @@ function renderOverview(d) {
     <div class="platform-card ${p.today_ok ? "" : p.status.startsWith("NO") || p.status === "ERROR" || p.status === "NETWORK" ? "failed" : ""}">
       <div class="pc-head">
         <div class="pc-name"><span class="pc-icon"><img src="${iconFor(p.name)}" width="30" height="30" alt=""></span>${esc(p.name)}</div>
-        ${badge(p.status, p.today_ok)}
+        ${badge(p.status, p.today_ok, p.probing)}
       </div>
       <div class="pc-credits">${fmtNum(p.credits)}</div>
       <div class="pc-meta">
@@ -311,6 +316,41 @@ async function refreshCredits(silent = true, source = "button") {
   } finally {
     refreshBusy = false;
     if (showBtn) { btn.disabled = false; btn.textContent = "刷新积分"; }
+  }
+}
+
+/* ---------- 今日状态核查 ---------- */
+// 「你在平台客户端/别的签到工具先签了，面板却显示未签到」的解药：
+// 打开/切回面板时让各平台脚本只读查一次「今天签过没有」，平台确认已签的
+// 卡片立即变绿。脚本只读、不领积分；服务端有防抖，连点刷新不会反复跑脚本。
+let probeBusy = false;
+const PROBE_RETRY_MS = 1500;      // busy 后的重试间隔
+const PROBE_RETRY_MAX = 8;        // 最多重试次数（覆盖启动时那一轮的耗时）
+async function checkStatus(attempt = 0) {
+  if (probeBusy) return null;
+  probeBusy = true;
+  try {
+    const r = await api("/api/check_status?source=page_load", { method: "POST" });
+    // disabled（配置关闭）：不必重拉数据
+    if (r.disabled) return r;
+    if (r.skipped) {
+      // 服务端区分了两种跳过原因，处理方式完全不同：
+      // - busy：启动/另一轮核查仍在跑，账本还没有结论 → 稍后重试，直到拿到结论
+      // - debounce：刚查过，账本已是最新 → 重拉一次数据即可（页面加载时账本
+      //   可能已被后台核查更新，只是我们渲染得早了一步）
+      if (r.reason === "busy" && attempt < PROBE_RETRY_MAX) {
+        setTimeout(() => checkStatus(attempt + 1), PROBE_RETRY_MS);
+        return r;
+      }
+      loadOverview(true);
+      return r;
+    }
+    if (r.signed > 0) loadOverview(true);   // 有新确认的已签，静默重画卡片
+    return r;
+  } catch (e) {
+    return null;      // 核查失败静默：卡片维持现状，60 秒轮询与手动签到兜底
+  } finally {
+    probeBusy = false;
   }
 }
 
@@ -547,7 +587,18 @@ async function loadLogs(page = logPage) {
       return;
     }
     const rows = d.logs.map((l, i) => {
-      const t = l.trigger === "schedule" ? "定时" : l.trigger === "health" ? "体检" : l.trigger === "refresh" ? "积分" : "手动";
+      // 触发列 = 触发方式 + 动作类型。隐藏积分源（*_credits）只查余额不签到，
+      // 与定时队列里混跑的签到脚本统一记 trigger=schedule 时无法区分，故按
+      // 平台名后缀（=脚本名去扩展名）先行分流为「积分查询」，其余再按 trigger 细分。
+      // 注意判定用 platform 而非 script：script 带扩展名（*_credits.py），endsWith 永远不中
+      const isCredits = (l.platform || "").endsWith("_credits");
+      const t = isCredits ? "积分查询"
+        : l.trigger === "schedule" ? "定时签到"
+        : l.trigger === "health" ? "体检"
+        : l.trigger === "refresh" ? "积分刷新"
+        : l.trigger === "probe" ? "状态核查"
+        : l.trigger === "retry" ? "自动补签"
+        : "手动签到";
       const credit = l.credit ? `+${l.credit}` : "—";
       const cls = (l.result || "").replace(/[^A-Z_]/g, "");
       return `<tr class="clickable" data-raw="${esc(l.raw || "")}">
@@ -587,6 +638,9 @@ switchPage(PAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : "ov
 // 服务端有防抖（credits.page_load_debounce，默认 30 秒），F5 连点不会反复跑脚本；
 // silent=true 不弹提示，刷新失败也静默（60 秒轮询与右上角按钮兜底）
 refreshCredits(true, "page_load");
+// 同时只读核查一次「今天在平台侧签过没有」：你先在客户端签了，这次打开面板
+// 就应当是已签到，不必再点一次签到、等脚本回报 ALREADY
+checkStatus();
 // 总览余额与过期日历每 60 秒静默重拉（后台 refresh 线程每 5 分钟补跑积分源；
 // 只拉数据不跑脚本，页面切到后台时暂停，回到前台立即补拉一次）。
 // 全部走静默模式：已有画面不清空重建，数据无变化时连 DOM 都不重写，
@@ -601,6 +655,9 @@ setInterval(() => {
 }, OVERVIEW_POLL_MS);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
+  // 从别的窗口/客户端切回来：先核查今日状态，再拉数据——用户往往正是刚在
+  // 平台客户端里点完签到才切回来，这一步能让卡片立刻变成已签到
+  checkStatus().then(() => {});
   if (currentPage() === "overview") loadOverview(true);
   if (currentPage() === "calendar") refreshCredits(true, "page_load");
 });

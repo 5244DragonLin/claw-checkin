@@ -43,8 +43,11 @@ Qoder **没有**传统的「一天一次签到接口」。每日权益以**活�
     "total_credits": 0
   }
 
-`streak_days` 恒为 0：上游没有可用的连续签到天数口径（legacy status 端点
-已全地区停用），不猜、不伪造，交给账本按自然日自行累计。
+`streak_days`：上游没有连续签到天数字段（legacy status 端点已全地区停用，
+实测恒回 DISABLED/0），活动列表也只吐当天一个窗口、没有历史。因此天数在
+本地累计（与 AutoClaw / 小浣熊同口径）：首次从领取台账回填，之后每确认一天
+领取 +1、同日不双计。口径是「本地有记录的领取天数」——在 Qoder 客户端里
+领的日子，只有脚本当天读到 CLAIMED 状态才会计入。
 
 凭据：客户端登录态是 Electron safeStorage 加密的，脚本不解密客户端密文，
 按 `auths/qoder.json` → `auths/qoder_sync.json` → 环境变量的优先级取；接入时
@@ -67,16 +70,28 @@ STATE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 
 DEFAULT_REWARD = 100.0
 RESULT_ALREADY_CLAIMED = "ALREADY_CLAIMED"
+# 活动窗口：当天 10:00 开窗 → 次日 09:59 关窗。10 点前读到的「已领取」是
+# 昨天那一窗的成绩，不能算成今天已签（面板会因此把今天误报成已完成）。
+WINDOW_OPEN_HOUR = 10
 
 
-def _out(result: str, report: str, today: int = 0, total: int = 0) -> dict:
-    return {
+def _in_today_window() -> bool:
+    """当前是否已过今天的开窗时刻（决定「已领取」是不是今天的成绩）。"""
+    return time.localtime().tm_hour >= WINDOW_OPEN_HOUR
+
+
+def _out(result: str, report: str, today: int = 0, total: int = 0,
+         streak: int = 0, signed_today: bool | None = None) -> dict:
+    out = {
         "result": result,
         "report": report,
         "today_credit": int(today),
-        "streak_days": 0,
+        "streak_days": int(streak),
         "total_credits": int(total),
     }
+    if signed_today is not None:
+        out["signed_today"] = bool(signed_today)
+    return out
 
 
 def _load_state() -> dict:
@@ -94,6 +109,45 @@ def _save_state(state: dict) -> None:
         _syncio.atomic_write_json(STATE_PATH, state)
     except Exception:
         pass
+
+
+def _streak_days(state: dict) -> int:
+    """本地累计领取天数（上游没有该字段，与 AutoClaw/小浣熊同口径在本地计）。
+
+    首次从领取台账回填历史：台账里的日期去掉「今天」的部分，再加上
+    「今天是否已确认领取」（last_date），避免明天领的时候把今天双计。
+    之后只增不减，存在 state 里；台账被清理也不影响已有计数。
+    """
+    if "streak_days" in state:
+        return int(state["streak_days"] or 0)
+    days: set[str] = set()
+    try:
+        import qoder_credits as qc
+
+        for row in qc.load_grants():
+            day = str(row.get("date") or "")
+            if len(day) == 10 and day[4] == "-" and day[7] == "-":
+                days.add(day)
+    except Exception:
+        pass  # 台账读不到就从 0 起数，不影响签到本身
+    streak = len(days)
+    if time.strftime("%Y-%m-%d") in days:
+        streak -= 1  # 今天那份由下面的确认逻辑记，不在这里预支
+    if state.get("last_date") == time.strftime("%Y-%m-%d"):
+        streak += 1
+    state["streak_days"] = streak
+    return streak
+
+
+def _confirm_day(state: dict) -> int:
+    """确认今天确有领取（自己领到 / 上游确认今天窗口已领）：累计 +1，每天只记一次。"""
+    _streak_days(state)  # 确保历史已回填
+    today = time.strftime("%Y-%m-%d")
+    if state.get("last_date") != today:
+        state["streak_days"] = int(state.get("streak_days") or 0) + 1
+        state["last_date"] = today
+        _save_state(state)
+    return int(state.get("streak_days") or 0)
 
 
 def _campaign_rows(payload: dict) -> list[dict]:
@@ -121,17 +175,22 @@ def _pick_target(rows: list[dict]) -> tuple[dict | None, bool]:
     return claimable, claimed
 
 
-def _no_claim(region: str, claimed: bool, risk_note: str | None, note: str = "") -> dict:
+def _no_claim(region: str, claimed: bool, risk_note: str | None,
+              streak: int, note: str = "") -> dict:
     if claimed:
-        return _out("ALREADY", "今日已领取" + (f"（{note}）" if note else ""))
+        return _out("ALREADY", f"今日已领取（连续 {streak} 天）"
+                    + (f"（{note}）" if note else ""), streak=streak)
     if region == qd.GLOBAL:
         if risk_note:
             return _out("ALREADY",
-                        f"未领取：{risk_note}。国际版签到需要本机安装 Qoder 客户端或 qodercli")
+                        f"未领取：{risk_note}。国际版签到需要本机安装 Qoder 客户端或 qodercli",
+                        streak=streak)
         return _out("ALREADY",
                     "上游暂未给该账号下发每日积分活动（活动窗口每天 10:00 开启，"
-                    "若今天已在 Qoder 客户端领过则活动行会消失），明天 10 点后再试")
-    return _out("ALREADY", "当前没有可领取的签到活动" + (f"（{note}）" if note else ""))
+                    "若今天已在 Qoder 客户端领过则活动行会消失），明天 10 点后再试",
+                    streak=streak)
+    return _out("ALREADY", "当前没有可领取的签到活动" + (f"（{note}）" if note else ""),
+                streak=streak)
 
 
 def _run() -> dict:
@@ -143,14 +202,18 @@ def _run() -> dict:
                     "运行一次 `python scripts/qoder.py --auth-token <accessToken>` 写入即可")
 
     region = creds["region"]
+    state = _load_state()
+    streak = _streak_days(state)
+    _save_state(state)  # 首次回填的天数落盘，之后只增不减（台账有 40 条上限会裁剪）
     headers = qd.sash_headers(creds["access"])
     payload, status, err = _fetch_campaigns(creds, headers)
 
     if payload is None and status in (401, 403):
-        return _out("NO_AUTH", "登录态被上游拒绝（HTTP %d），请更新 accessToken" % status)
+        return _out("NO_AUTH", "登录态被上游拒绝（HTTP %d），请更新 accessToken" % status,
+                    streak=streak)
     if payload is None:
         result = "NETWORK" if status in (-1, 429, 502, 503, 504) else "ERROR"
-        return _out(result, f"活动列表查询失败：{err or status}")
+        return _out(result, f"活动列表查询失败：{err or status}", streak=streak)
 
     # 国际版：先拿顶层 uid，叠风控头重拉一次（中国版不需要）
     risk_note = None
@@ -162,12 +225,16 @@ def _run() -> dict:
         payload, status, err = _fetch_campaigns(creds, headers)
         if payload is None:
             result = "NETWORK" if status in (-1, 429, 502, 503, 504) else "ERROR"
-            return _out(result, f"活动列表查询失败（风控重拉）：{err or status}")
+            return _out(result, f"活动列表查询失败（风控重拉）：{err or status}", streak=streak)
 
     rows = _campaign_rows(payload)
     target, claimed = _pick_target(rows)
     if target is None:
-        return _no_claim(region, claimed, risk_note)
+        # 上游确认今天窗口已领（可能是在 Qoder 客户端里领的）：10 点后的
+        # 「已领取」才是今天那一窗，计入本地天数；10 点前是昨天的成绩
+        if claimed and _in_today_window():
+            streak = _confirm_day(state)
+        return _no_claim(region, claimed, risk_note, streak)
 
     campaign_id = str(target.get("campaignId") or "").strip()
     if not campaign_id:
@@ -178,19 +245,24 @@ def _run() -> dict:
 
     # 上游并发/重放时返回 409 + {"result":"ALREADY_CLAIMED"}，不是失败
     if body is None and status == 409:
-        return _out("ALREADY", "今日已领取")
+        streak = _confirm_day(state)
+        return _out("ALREADY", f"今日已领取（连续 {streak} 天）", streak=streak)
     if body is not None and str(body.get("result") or "") == RESULT_ALREADY_CLAIMED:
-        return _out("ALREADY", "今日已领取")
+        streak = _confirm_day(state)
+        return _out("ALREADY", f"今日已领取（连续 {streak} 天）", streak=streak)
     if body is None:
         if status in (401, 403):
-            return _out("NO_AUTH", f"领取被拒绝（HTTP {status}），请更新 accessToken")
+            return _out("NO_AUTH", f"领取被拒绝（HTTP {status}），请更新 accessToken",
+                        streak=streak)
         result = "NETWORK" if status in (-1, 429, 502, 503, 504) else "ERROR"
-        return _out(result, f"签到领取失败：{err or status}")
+        return _out(result, f"签到领取失败：{err or status}", streak=streak)
 
     if str(body.get("status") or "") != qd.STATUS_CLAIMED:
-        return _out("ALREADY", f"签到未完成（上游状态 {body.get('status') or '未知'}）")
+        return _out("ALREADY", f"签到未完成（上游状态 {body.get('status') or '未知'}）",
+                    streak=streak)
     if bool(body.get("replayed")):
-        return _out("ALREADY", "今日已领取")
+        streak = _confirm_day(state)
+        return _out("ALREADY", f"今日已领取（连续 {streak} 天）", streak=streak)
 
     benefit = body.get("benefit") if isinstance(body.get("benefit"), dict) else {}
     try:
@@ -218,28 +290,35 @@ def _run() -> dict:
         except Exception:
             pass  # 台账失败不影响签到本身
 
-    state = _load_state()
-    state["last_date"] = time.strftime("%Y-%m-%d")
+    streak = _confirm_day(state)
     state["last_reward"] = reward
     state["region"] = region
     _save_state(state)
 
-    return _out("CLAIMED", message, today=reward, total=0)
+    return _out("CLAIMED", f"{message}（连续 {streak} 天）", today=reward, total=0,
+                streak=streak)
 
 
 def _status() -> dict:
-    """只查活动状态与连续活跃天数，不领取。"""
+    """只读查询活动状态与连续活跃天数，不领取。
+
+    `--status` 也用于面板的状态核查：claimed=True 即「平台侧今天已领」（置
+    signed_today），target 存在即「明确还没领」（置 false）。两种都没有时（今天
+    没下发活动）无法判断，不置该字段——留给面板按「未签到」显示，不猜。
+    """
     creds = qd.resolve_credentials()
     if creds is None:
         where = "、".join(label for label, _path in qd.credential_sources())
         return _out("NO_AUTH", f"未找到 Qoder 登录凭据（{where}、环境变量均无）")
 
     region = creds["region"]
+    state = _load_state()
+    streak = _streak_days(state)
     headers = qd.sash_headers(creds["access"])
     payload, status, err = _fetch_campaigns(creds, headers)
     if payload is None:
         result = "NETWORK" if status in (-1, 429, 502, 503, 504) else "ERROR"
-        return _out(result, f"活动列表查询失败：{err or status}")
+        return _out(result, f"活动列表查询失败：{err or status}", streak=streak)
 
     risk_note = None
     if region == qd.GLOBAL:
@@ -247,7 +326,8 @@ def _status() -> dict:
         headers, risk_note = qd.augmented_headers(region, creds["access"], uid)
         payload, status, err = _fetch_campaigns(creds, headers)
         if payload is None:
-            return _out("ERROR", f"活动列表查询失败（风控重拉）：{err or status}")
+            return _out("ERROR", f"活动列表查询失败（风控重拉）：{err or status}",
+                        streak=streak)
 
     rows = _campaign_rows(payload)
     target, claimed = _pick_target(rows)
@@ -258,12 +338,19 @@ def _status() -> dict:
         amount = benefit.get("amount")
         return _out("ALREADY",
                     f"{region_label}：有可领取的签到活动（{amount or DEFAULT_REWARD:g} credits），"
-                    "点签到即可领取")
+                    "点签到即可领取",
+                    streak=streak, signed_today=False)
     if claimed:
-        return _out("ALREADY", f"{region_label}：今日已领取")
+        # 10 点前窗口还没刷新：此刻的「已领取」是昨天那一窗的，今天还没开始
+        if _in_today_window():
+            return _out("ALREADY", f"{region_label}：今日已领取（连续 {streak} 天）",
+                        streak=streak, signed_today=True)
+        return _out("ALREADY",
+                    f"{region_label}：昨日已领取，今天 10:00 开窗后可再领",
+                    streak=streak)
     if risk_note:
-        return _out("ALREADY", f"{region_label}：未领取：{risk_note}")
-    return _out("ALREADY", f"{region_label}：当前没有可领取的签到活动")
+        return _out("ALREADY", f"{region_label}：未领取：{risk_note}", streak=streak)
+    return _out("ALREADY", f"{region_label}：当前没有可领取的签到活动", streak=streak)
 
 
 def _device_login(argv: list[str]) -> int:

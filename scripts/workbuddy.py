@@ -18,8 +18,13 @@
     "today_credit": 100,
     "streak_days": 7,
     "total_credits": 700,
-    "expiring": []   // 可选
+    "expiring": [],   // 可选
+    "signed_today": true  // 可选：平台侧确认今天已签（仅 --status 只读查询会带上）
   }
+
+`--status`：只读查询今天签没签（调 signin.py 的 status 命令，读
+`today_checked_in`），**不领取任何积分**。面板在打开/切回时用它承认「你在
+客户端已经签过」的到，免得卡片一直显示未签到。
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ SIGNIN_CANDIDATES = [
 ]
 
 SIGNIN_TIMEOUT = 120  # 签到 + 成长中心预算
+STATUS_TIMEOUT = 60   # 只读查询（含客户端解密）
 
 
 def _find_signin() -> str | None:
@@ -123,6 +129,155 @@ def _parse_signin_output(stdout: str) -> dict | None:
     return None
 
 
+def _signin_env(signin_path: str, auth_file: str | None = None) -> dict:
+    """构造 signin.py 子进程环境：显式指定凭据文件 + 日志位置。
+
+    auth_file 为空时按本地优先规则现选一份。凭据一律显式传给内核，不再依赖它
+    自己猜——回退重试时要能指定「另一份」。
+    """
+    env = os.environ.copy()
+    try:
+        _wbsync.update_from_local(signin_path)
+    except Exception:
+        pass
+    target = auth_file if auth_file is not None else _wbsync.pick()[0]
+    if target:
+        env["WORKBUDDY_AUTH_FILE"] = target
+    if "WORKBUDDY_SIGNIN_LOG" not in env:
+        data_dir = os.path.join(PROJECT_ROOT, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        env["WORKBUDDY_SIGNIN_LOG"] = os.path.join(data_dir, "workbuddy_signin.log")
+    return env
+
+
+# 这些结论等同于「凭据没被服务端接受」，值得换另一份凭据重试
+AUTH_PROBLEM_RESULTS = {"NO_AUTH", "NO_SESSION", "AUTH_REJECTED", "AUTH_ERROR",
+                        "FORBIDDEN", "INVALID_RUNTIME_PATH", "KEY_MISMATCH",
+                        "DECRYPT_FAILED", "HELPER_PROTOCOL"}
+_LAST_STDERR = ""   # 最近一次 signin.py 的 stderr 尾巴，仅用于失败时的报告文案
+
+
+def _is_auth_problem(data: dict | None) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if str(data.get("http") or "") == "401":
+        return True
+    return str(data.get("result") or "").upper() in AUTH_PROBLEM_RESULTS
+
+
+def _run_signin(signin_path: str, mode: str, auth_file: str | None) -> tuple[dict | None, str]:
+    """跑一次 signin.py（mode = auto / status），返回 (解析结果, 失败类别)。"""
+    global _LAST_STDERR
+    env = _signin_env(signin_path, auth_file)
+    try:
+        proc = subprocess.run(
+            ["python", str(signin_path), mode],
+            capture_output=True, text=True,
+            timeout=SIGNIN_TIMEOUT if mode == "auto" else STATUS_TIMEOUT,
+            encoding="utf-8", errors="replace",
+            cwd=os.path.dirname(signin_path), env=env,
+        )
+    except FileNotFoundError:
+        return None, "no-python"
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    _LAST_STDERR = (proc.stderr or "")[-300:]
+    data = _parse_signin_output(proc.stdout or "")
+    return data, ("" if data is not None else "bad-output")
+
+
+def _run_with_fallback(signin_path: str, mode: str) -> tuple[dict | None, str, str | None]:
+    """先按本地优先选一份凭据跑；被服务端拒绝就换另一份重试一次。
+
+    返回 (解析结果, 失败类别, 真正拿来用的凭据路径)。重试成功的那份会被回写进
+    跨机镜像——它刚被服务端接受过，是当下唯一有实证可用的凭据。
+    """
+    primary, _source = _wbsync.pick()
+    data, err = _run_signin(signin_path, mode, primary)
+    if not _is_auth_problem(data):
+        return data, err, primary
+
+    alt = _wbsync.alternate(primary)
+    if not alt:
+        return data, err, primary
+    retry, retry_err = _run_signin(signin_path, mode, alt)
+    if retry is not None and not _is_auth_problem(retry):
+        try:
+            _wbsync.heal_mirror(alt, signin_path)
+        except Exception:
+            pass
+        return retry, retry_err, alt
+    # 两份都不认：优先报告换过之后的结果（信息更具体）
+    return (retry, retry_err, alt) if retry is not None else (data, err, primary)
+
+
+def _dig(obj, key):
+    """在可能被 data/result 包裹的响应里找字段（与 signin.py 同款容错）。"""
+    if isinstance(obj, dict):
+        if obj.get(key) is not None:
+            return obj[key]
+        for k in ("data", "result", "resp", "response"):
+            if isinstance(obj.get(k), dict):
+                got = _dig(obj[k], key)
+                if got is not None:
+                    return got
+    return None
+
+
+def _status_probe() -> dict:
+    """只读查询「今天签过没有」：跑 signin.py 的 status 命令，绝不触发领取。
+
+    status 只打 `checkin-activity-status`（GET 语义的查询接口），不做任何写入。
+    只有平台明确回报 today_checked_in 为真时才置 signed_today=true——拿不准就
+    不填，宁可显示未签到，也不谎报已签。
+    """
+    signin_path = _find_signin()
+    if not signin_path:
+        return {"result": "NO_AUTH", "report": "未找到 WorkBuddy 签到内核 signin.py",
+                "today_credit": 0, "streak_days": 0, "total_credits": 0}
+    data, err, _used = _run_with_fallback(signin_path, "status")
+    if data is None:
+        if err == "no-python":
+            return {"result": "NETWORK", "report": "找不到 python 解释器，请确认 Python 已安装且加入 PATH",
+                    "today_credit": 0, "streak_days": 0, "total_credits": 0}
+        if err == "timeout":
+            return {"result": "NETWORK", "report": f"状态查询超时（>{STATUS_TIMEOUT}s）",
+                    "today_credit": 0, "streak_days": 0, "total_credits": 0}
+        return {"result": "ERROR", "report": "状态查询未返回可解析结果",
+                "today_credit": 0, "streak_days": 0, "total_credits": 0}
+    if _is_auth_problem(data):
+        return {"result": "NO_AUTH", "report": str(data.get("report") or "登录凭据未就绪"),
+                "today_credit": 0, "streak_days": 0, "total_credits": 0}
+
+    http = data.get("http") or 0
+    if not (200 <= int(http) < 300):
+        return {"result": "NETWORK" if int(http) in (0, 429, 502, 503, 504) else "ERROR",
+                "report": f"状态查询失败（HTTP {http}）",
+                "today_credit": 0, "streak_days": 0, "total_credits": 0}
+
+    body = data.get("body") if isinstance(data.get("body"), dict) else {}
+    signed = _dig(body, "today_checked_in") in (True, 1)
+    active = _dig(body, "active")
+    out = {
+        "result": "ALREADY" if signed else "ERROR",
+        "report": "",
+        "today_credit": 0,
+        "streak_days": int(_dig(body, "streak_days") or 0),
+        "total_credits": int(_dig(body, "total_credits") or 0),
+        "signed_today": signed,
+    }
+    if signed:
+        streak = out["streak_days"]
+        out["report"] = "平台确认今日已签到" + (f"（连续 {streak} 天）" if streak else "")
+    elif active is False:
+        out["result"] = "ALREADY"
+        out["report"] = "签到活动未开启"
+    else:
+        out["result"] = "ALREADY"
+        out["report"] = "平台显示今天尚未签到"
+    return out
+
+
 def _remap(result: dict) -> dict:
     """将 signin.py 的输出字段映射为 ClawCheckin 契约格式。
 
@@ -156,18 +311,26 @@ def _remap(result: dict) -> dict:
     return remapped
 
 
+def _ensure_runtime() -> None:
+    """把 WorkBuddy 可执行文件路径写进本进程环境变量。
+
+    必须先于一切解密操作——signin.py 子进程靠它解密凭据，跨机镜像的明文提取
+    （_wbsync）同样靠它。
+    """
+    if "WORKBUDDY_EXE" in os.environ:
+        return
+    for candidate in (
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe"),
+        r"D:\WorkBuddy\WorkBuddy.exe",
+        r"D:\Program Files\WorkBuddy\WorkBuddy.exe",
+    ):
+        if os.path.isfile(candidate):
+            os.environ["WORKBUDDY_EXE"] = candidate
+            return
+
+
 def main():
-    # WorkBuddy 可执行文件路径：写进本进程环境变量，且必须先于一切解密操作——
-    # signin.py 子进程靠它解密凭据，跨机镜像的明文提取（_wbsync）同样靠它
-    if "WORKBUDDY_EXE" not in os.environ:
-        for candidate in (
-            os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe"),
-            r"D:\WorkBuddy\WorkBuddy.exe",
-            r"D:\Program Files\WorkBuddy\WorkBuddy.exe",
-        ):
-            if os.path.isfile(candidate):
-                os.environ["WORKBUDDY_EXE"] = candidate
-                break
+    _ensure_runtime()
 
     # --refresh：纯凭证刷新，只校验凭据不执行签到
     if "--refresh" in sys.argv:
@@ -186,6 +349,12 @@ def main():
         print(json.dumps(out, ensure_ascii=False))
         return 0 if out["result"] == "ALREADY" else 1
 
+    # --status：只读查询今天签没签（不领取），供面板承认在别处签的到
+    if "--status" in sys.argv:
+        out = _status_probe()
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if out["result"] in ("CLAIMED", "ALREADY") else 1
+
     signin_path = _find_signin()
     if not signin_path:
         print(json.dumps({
@@ -199,61 +368,30 @@ def main():
         }, ensure_ascii=False))
         return 2
 
-    env = os.environ.copy()
-
-    # 尽力把本机最新凭据同步进跨机镜像（能解密的一侧负责产出明文镜像），
-    # 再决定 signin.py 读本地凭据还是同步镜像（双机轮流使用，见 _wbsync）
-    try:
-        _wbsync.update_from_local(signin_path)
-    except Exception:
-        pass
-    _auth_path, _auth_source = _wbsync.pick()
-    if _auth_source == "mirror":
-        env["WORKBUDDY_AUTH_FILE"] = _wbsync.MIRROR_PATH
-
-    # signin.py 默认把日志写到自身同目录；重定向到项目 data/，保持 vendor/ 干净
-    if "WORKBUDDY_SIGNIN_LOG" not in env:
-        data_dir = os.path.join(PROJECT_ROOT, "data")
-        os.makedirs(data_dir, exist_ok=True)
-        env["WORKBUDDY_SIGNIN_LOG"] = os.path.join(data_dir, "workbuddy_signin.log")
-
-    try:
-        proc = subprocess.run(
-            ["python", str(signin_path), "auto"],
-            capture_output=True,
-            text=True,
-            timeout=SIGNIN_TIMEOUT,
-            encoding="utf-8",
-            errors="replace",
-            cwd=os.path.dirname(signin_path),
-            env=env,
-        )
-    except FileNotFoundError:
-        print(json.dumps({
-            "result": "ERROR",
-            "report": "找不到 python 解释器，请确认 Python 已安装且加入 PATH",
-            "today_credit": 0,
-            "streak_days": 0,
-            "total_credits": 0,
-        }, ensure_ascii=False))
-        return 1
-    except subprocess.TimeoutExpired:
-        print(json.dumps({
-            "result": "ERROR",
-            "report": f"签名脚本执行超时（>{SIGNIN_TIMEOUT}s），下次自动重试",
-            "today_credit": 0,
-            "streak_days": 0,
-            "total_credits": 0,
-        }, ensure_ascii=False))
-        return 1
-
-    data = _parse_signin_output(proc.stdout or "")
+    data, err, _used = _run_with_fallback(signin_path, "auto")
     if data is None:
-        # 解析失败时检查 stderr
-        stderr_tail = (proc.stderr or "")[-300:]
+        if err == "no-python":
+            print(json.dumps({
+                "result": "ERROR",
+                "report": "找不到 python 解释器，请确认 Python 已安装且加入 PATH",
+                "today_credit": 0,
+                "streak_days": 0,
+                "total_credits": 0,
+            }, ensure_ascii=False))
+            return 1
+        if err == "timeout":
+            print(json.dumps({
+                "result": "ERROR",
+                "report": f"签名脚本执行超时（>{SIGNIN_TIMEOUT}s），下次自动重试",
+                "today_credit": 0,
+                "streak_days": 0,
+                "total_credits": 0,
+            }, ensure_ascii=False))
+            return 1
+        # 解析失败时附上 signin.py 的 stderr 尾巴
         print(json.dumps({
             "result": "ERROR",
-            "report": f"signin.py stdout 末行非 JSON，请检查客户端登录状态：{stderr_tail}",
+            "report": f"signin.py stdout 末行非 JSON，请检查客户端登录状态：{_LAST_STDERR}",
             "today_credit": 0,
             "streak_days": 0,
             "total_credits": 0,

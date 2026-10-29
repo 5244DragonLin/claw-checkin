@@ -26,6 +26,7 @@ class ScriptInfo:
     executor_label: str  # 展示用执行器名称
     ext: str
     hidden: bool = False # 隐藏平台（子功能），不出现在接入页/概览页
+    probe: bool = False  # 支持 `--status` 只读查询今日是否已签
 
     def to_dict(self) -> dict:
         return {
@@ -34,7 +35,19 @@ class ScriptInfo:
             "executor": self.executor,
             "executor_label": self.executor_label,
             "hidden": self.hidden,
+            "probe": self.probe,
         }
+
+
+def _load_meta(scripts_dir: Path) -> dict:
+    meta = scripts_dir / "_meta.json"
+    if not meta.is_file():
+        return {}
+    try:
+        doc = json.loads(meta.read_text(encoding="utf-8"))
+    except Exception:
+        return {}   # 解析失败按空配置处理，不阻断扫描
+    return doc if isinstance(doc, dict) else {}
 
 
 def scan_scripts(scripts_dir: Path) -> list[ScriptInfo]:
@@ -42,13 +55,11 @@ def scan_scripts(scripts_dir: Path) -> list[ScriptInfo]:
     if not scripts_dir.is_dir():
         return []
     # 读取隐藏平台清单（下划线开头文件本身不会被注册为平台）
-    hidden: set[str] = set()
-    meta = scripts_dir / "_meta.json"
-    if meta.is_file():
-        try:
-            hidden = set(json.loads(meta.read_text(encoding="utf-8")).get("hidden", []) or [])
-        except Exception:
-            hidden = set()  # 解析失败按空集处理，不阻断扫描
+    meta = _load_meta(scripts_dir)
+    hidden: set[str] = set(meta.get("hidden", []) or [])
+    # 支持 --status 只读核查的平台清单。必须显式登记：脚本不认识 --status 时
+    # 通常会把参数忽略掉、照常签到，自动探测等于替用户多点一次签到
+    probe: set[str] = set(meta.get("status_probe", []) or [])
     found: list[ScriptInfo] = []
     for f in sorted(scripts_dir.iterdir()):
         if not f.is_file() or f.name.startswith((".", "_")):
@@ -64,22 +75,25 @@ def scan_scripts(scripts_dir: Path) -> list[ScriptInfo]:
             executor_label=f"{label} · {f.name}",
             ext=ext,
             hidden=f.stem in hidden,
+            probe=f.stem in probe,
         ))
     found.sort(key=lambda s: s.name.lower())
     return found
 
 
-def build_command(info: ScriptInfo) -> list[str]:
-    """构造执行命令。"""
+def build_command(info: ScriptInfo, status: bool = False) -> list[str]:
+    """构造执行命令。status=True 时追加 `--status`（只读查询，不签到）。"""
     ex = info.executor
+    suffix = ["--status"] if status else []
     if ex == "python":
-        return ["python", str(info.path)]
+        return ["python", str(info.path)] + suffix
     if ex == "node":
-        return ["node", str(info.path)]
+        return ["node", str(info.path)] + suffix
     if ex == "bash":
-        return ["bash", str(info.path)]
+        return ["bash", str(info.path)] + suffix
     if ex == "cmd":
-        return ["cmd", "/c", str(info.path)]
+        return ["cmd", "/c", str(info.path)] + suffix
     if ex == "powershell":
-        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(info.path)]
-    return [str(info.path)]
+        return (["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(info.path)] + suffix)
+    return [str(info.path)] + suffix

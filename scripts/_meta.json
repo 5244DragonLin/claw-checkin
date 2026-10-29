@@ -1,1 +1,4 @@
-{"hidden": ["qoder_credits", "workbuddy_credits", "autoclaw_credits", "商汤小浣熊_credits"]}
+{
+  "hidden": ["qoder_credits", "workbuddy_credits", "autoclaw_credits", "商汤小浣熊_credits", "trae_credits"],
+  "status_probe": ["workbuddy", "autoclaw", "qoder", "商汤小浣熊", "trae"]
+}
