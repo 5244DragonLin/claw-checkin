@@ -169,10 +169,13 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
                 return None, "debounce"
             _last_probe[0] = now
             today = datetime.now().strftime("%Y-%m-%d")
-            signed = ledger.platforms_signed_today(today)
+            # 已给出结论的平台（含「今天确实没签」的否定结论）都跳过：否则每天
+            # 10 点前的每一次页面刷新都会为同一个「还没开窗」的平台重复打上游
+            answered = ledger.platforms_answered_today(
+                today, deny_ttl_minutes=cfg.probe.deny_ttl_minutes)
             results = []
             for s in _visible():
-                if not s.probe or s.name in signed:
+                if not s.probe or s.name in answered:
                     continue
                 try:
                     rr = run_script(s.name, s.path,
@@ -180,10 +183,12 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
                 except Exception as e:      # 核查失败不影响面板，也不写账本
                     log.warning("状态核查失败 %s：%s", s.name, e)
                     continue
-                if rr.signed_today or rr.result == "CLAIMED":
+                if rr.signed_today or rr.signed_today_known or rr.result == "CLAIMED":
                     ledger.insert_run(rr, trigger=PROBE_TRIGGER)
                     log.info("状态核查 %s → %s", s.name,
-                             "平台确认今日已签" if rr.signed_today else "核查链路真实签到")
+                             "平台确认今日已签" if rr.signed_today
+                             else ("平台确认今日未签" if rr.signed_today_known
+                                   else "核查链路真实签到"))
                 results.append({"platform": s.name, "result": rr.result,
                                 "signed_today": rr.signed_today,
                                 "report": rr.report})
@@ -362,15 +367,18 @@ def create_app(config: AppConfig | None = None, ledger: Ledger | None = None) ->
             status = today_row["result"] if today_row else "PENDING"
             probing = bool(_probing[0] and s.probe and not today_row)
             # 积分源余额优先；无积分源时回退签到脚本自己的 total_credits；
-            # 两者都没有（如刚清空日志但积分源已刷新）才置 0
+            # 两者都没读到（余额未知/平台不提供积分）保持 None——前端显示「—」，
+            # 不写 0 冒充「余额为零」（2026-11-09：库库连签奖励是抽奖次数不是积分，
+            # 无积分活动可读时卡片显示 0 会被误读成「签到没给分」）
             if s.name in credit_source:
                 credits = credit_source[s.name]
             elif row and row["total_credits"] is not None:
                 credits = row["total_credits"]
             else:
-                credits = 0
+                credits = None
             streak = row["streak_days"] if row and row["streak_days"] is not None else 0
-            total_credits += credits
+            if credits is not None:
+                total_credits += credits
             max_streak = max(max_streak, streak)
             # 仅统计未来 14 天内到期的积分（与 expiring_detail / 日历窗口口径一致）
             exp_rows = _expiring_for(s.name)

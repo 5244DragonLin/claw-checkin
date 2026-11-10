@@ -271,6 +271,9 @@ tr.clickable:hover td { background: var(--row-alt); }
 }
 .toast.ok { border-left: 4px solid var(--ok-tx); }
 .toast.fail { border-left: 4px solid var(--fail-tx); }
+/* warn：脚本明确说「这次没签到成功但也不是失败」（Qoder 10:00 前窗口没开、
+   领到的是上一窗的补领）。用橙色与「绿=已签 / 红=失败」区分开 */
+.toast.warn { border-left: 4px solid var(--orange-tx); }
 .toast b { display: block; margin-bottom: 3px; }
 .toast small { color: var(--muted); }
 @keyframes slidein { from { opacity: 0; transform: translateX(16px);} to { opacity: 1; } }

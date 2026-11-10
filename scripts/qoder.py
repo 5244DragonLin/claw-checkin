@@ -16,6 +16,8 @@ Qoder **没有**传统的「一天一次签到接口」。每日权益以**活�
 
 实测口径（agent2api 在真实账号上验证过）：
   · 活动窗口是中国时间**当天 10:00 → 次日 09:59**（官方「每天 10:00 刷新」）；
+    窗口边界以活动行自带的 `startAt` / `endAt` 为准（本地小时数只是兜底），
+    因为「开窗前读到的 CLAIMED 属于昨天那一窗」这个判断全靠它；
   · 领取的钱落在 `/api/v2/quota/usage` 的 `addOnQuota` 桶里（余额面板「资源包」
     那一行），不是普通 Credits 余额，所以本脚本不去猜余额，只报领到的额度；
   · **领取后活动行不消失**，`claimStatus` 从 `CLAIMABLE` 变 `CLAIMED` ——
@@ -40,8 +42,15 @@ Qoder **没有**传统的「一天一次签到接口」。每日权益以**活�
     "report": "可读汇报",
     "today_credit": 100,
     "streak_days": 0,
-    "total_credits": 0
+    "total_credits": 0,
+    "signed_today": true        // 仅当「今天这一窗确实已领」时置 true；
+                                // 开窗前查到昨天那窗的 CLAIMED 时显式置 false
   }
+
+`signed_today` 三态（与 runner 契约一致）：true = 今天已领；false = 今天确实
+没领（例如 10:00 前窗口还没刷新）；字段缺省 = 说不准。开窗前必须显式给 false：
+旧版本这里只报「今日已领取」，面板据此把卡片标成已签到、按钮变「今日已完成」，
+用户以为今天的分已经到手，其实一分没进账（2026-11-10 实测的误导来源）。
 
 `streak_days`：上游没有连续签到天数字段（legacy status 端点已全地区停用，
 实测恒回 DISABLED/0），活动列表也只吐当天一个窗口、没有历史。因此天数在
@@ -72,11 +81,54 @@ DEFAULT_REWARD = 100.0
 RESULT_ALREADY_CLAIMED = "ALREADY_CLAIMED"
 # 活动窗口：当天 10:00 开窗 → 次日 09:59 关窗。10 点前读到的「已领取」是
 # 昨天那一窗的成绩，不能算成今天已签（面板会因此把今天误报成已完成）。
+# 这个小时数只是兜底：活动行自带 startAt/endAt，能读到就以它为准（见
+# _window_open），以免官方改了刷新时刻后本地判断失真。
 WINDOW_OPEN_HOUR = 10
 
 
-def _in_today_window() -> bool:
-    """当前是否已过今天的开窗时刻（决定「已领取」是不是今天的成绩）。"""
+def _start_ts(row: dict) -> float | None:
+    """活动行的窗口开始时刻（秒级时间戳）；没有可用时间戳返回 None。"""
+    try:
+        start = float(row.get("startAt"))
+    except (TypeError, ValueError):
+        return None
+    return start / 1000.0 if start > 1e11 else start        # 兼容毫秒
+
+
+def _row_starts_today(row: dict) -> bool | None:
+    """活动行的整段窗口是否落在今天（True 今天的、False 更早的、None 无时间戳）。"""
+    start = _start_ts(row)
+    if start is None:
+        return None
+    today = time.strftime("%Y-%m-%d")
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(start)) == today
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _window_open(rows: list[dict]) -> bool:
+    """今天这一窗是否已经开过（决定上游的「已领取」算不算今天的成绩）。
+
+    口径按可信度排序：
+      1. 有 CLAIM_BENEFIT 行且带 startAt：只要存在 startAt 落在今天的行，就看
+         此刻是否已过它；一条都没有今天的，说明上游还没下发今天这一窗 → False
+         （此时列表里的 CLAIMED 必然是昨天那一窗的）。
+      2. 行里没有可用时间戳（上游改结构）：退回本地小时数 ≥ 10。
+    宁可保守判「没开窗」，也不要谎报已签——谎报会让面板把今天标成已完成。
+    """
+    saw_stamp = False
+    for row in rows:
+        if str(row.get("actionType") or "") != qd.ACTION_CLAIM_BENEFIT:
+            continue
+        today = _row_starts_today(row)
+        if today is None:
+            continue
+        saw_stamp = True
+        if today:
+            return time.time() >= _start_ts(row)
+    if saw_stamp:
+        return False                # 有行但都属于更早的窗口：今天还没开窗
     return time.localtime().tm_hour >= WINDOW_OPEN_HOUR
 
 
@@ -176,11 +228,22 @@ def _pick_target(rows: list[dict]) -> tuple[dict | None, bool]:
 
 
 def _no_claim(region: str, claimed: bool, risk_note: str | None,
-              streak: int, note: str = "") -> dict:
+              streak: int, note: str = "", window_open: bool = True) -> dict:
     if claimed:
-        return _out("ALREADY", f"今日已领取（连续 {streak} 天）"
-                    + (f"（{note}）" if note else ""), streak=streak)
+        if window_open:
+            return _out("ALREADY", f"今日已领取（连续 {streak} 天）"
+                        + (f"（{note}）" if note else ""),
+                        streak=streak, signed_today=True)
+        # 开窗前：上游那条 CLAIMED 是昨天那一窗的成绩，今天还没开始领。
+        # 必须显式 signed_today=False，否则面板会把今天标成已完成，
+        # 而实际上今天这 100 credits 根本还没到账（2026-11-10 的误导）
+        return _out("ALREADY", f"今天还没开窗（10:00 后可再领）；"
+                    f"刚读到的是昨天已领取（连续 {streak} 天）",
+                    streak=streak, signed_today=False)
     if region == qd.GLOBAL:
+        # 「没有活动行」不等于「今天没领」：国际版缺 UMID 组件时本来就不下发，
+        # 中国版也可能已在客户端领过而列表不再给可领行。所以这两种情况不置
+        # signed_today，留给面板按「未签到」显示，不猜
         if risk_note:
             return _out("ALREADY",
                         f"未领取：{risk_note}。国际版签到需要本机安装 Qoder 客户端或 qodercli",
@@ -191,6 +254,94 @@ def _no_claim(region: str, claimed: bool, risk_note: str | None,
                     streak=streak)
     return _out("ALREADY", "当前没有可领取的签到活动" + (f"（{note}）" if note else ""),
                 streak=streak)
+
+
+def _claimed_already(state: dict, streak: int, carry_over: bool) -> dict:
+    """上游回报「这条活动已经领过了」。
+
+    `carry_over` 表示这条活动属于上一窗（开窗前读到/领到的），那不是今天的成绩：
+    不记今天的连续天数，并显式 signed_today=False，面板才不会把今天标成已完成。
+    """
+    streak = streak if carry_over else _confirm_day(state)
+    return _out("ALREADY",
+                (f"昨天那一窗已领取（连续 {streak} 天）" if carry_over
+                 else f"今日已领取（连续 {streak} 天）"),
+                streak=streak, signed_today=not carry_over)
+
+
+def _note_grant_from(body: dict) -> None:
+    """把一次 claim 响应里的权威到期时刻记进领取台账。
+
+    `expiresAt` 只出现在 claim 响应里（活动列表与额度接口都不给逐笔到期时间，
+    上游也没有领取历史接口），所以过期日历全靠这个台账。记失败不影响签到本身。
+    """
+    if not isinstance(body, dict):
+        return
+    expires_at = str(body.get("expiresAt") or "").strip()
+    if not expires_at:
+        return
+    benefit = body.get("benefit") if isinstance(body.get("benefit"), dict) else {}
+    try:
+        reward = float(benefit.get("amount"))
+    except (TypeError, ValueError):
+        reward = DEFAULT_REWARD
+    try:
+        import qoder_credits as qc
+
+        qc.note_grant(reward, expires_at)
+    except Exception:
+        pass
+
+
+def _grant_known(today: str) -> bool:
+    """台账里今天是否已有一笔领取记录（用于避免重复补记）。
+
+    台账只存 {date, amount, expiresAt}，没有 campaignId，所以按「发放日=今天」
+    判断。同一天最多领一笔（活动窗口一天一开），这个粒度足够。
+    """
+    try:
+        import qoder_credits as qc
+
+        return any(str(r.get("date") or "") == today for r in qc.load_grants())
+    except Exception:
+        return True     # 台账读不到时按「已有」处理，不打扰上游
+
+
+def _backfill_grant(creds: dict, headers: list[tuple[str, str]], rows: list[dict]) -> None:
+    """台账缺了「今天这一窗」的笔目时，重放一次 claim 把它补回来。
+
+    背景（2026-11-10 真机）：脚本读到活动已是 CLAIMED 就直接报「今日已领取」、
+    不再调 claim —— 而 `expiresAt` 只在 claim 响应里，于是那些日子在台账里
+    一笔都没有。真机后果：资源包 3000 分的台账只有 17 笔（1700 分），过期日历
+    靠「余额填最早笔目」硬凑，把 100 分报成 11-11 到期（实际是 12-10）。
+
+    上游对已领活动重放是幂等的（回 `replayed: true`，不重复加分），响应里带
+    权威的 `expiresAt`，所以补一次 claim 既安全又能拿到到期时刻。只在台账里
+    确实没有今天这一笔时才补，避免每次运行都白打一发。
+    """
+    today = time.strftime("%Y-%m-%d")
+    if _grant_known(today):
+        return
+    if not any(str(r.get("actionType") or "") == qd.ACTION_CLAIM_BENEFIT
+               and str(r.get("claimStatus") or "") == qd.STATUS_CLAIMED
+               and _row_starts_today(r) is not False
+               for r in rows):
+        return              # 没有「今天这一窗且已领」的活动行：没什么可补的
+    for row in rows:
+        if str(row.get("actionType") or "") != qd.ACTION_CLAIM_BENEFIT:
+            continue
+        if str(row.get("claimStatus") or "") != qd.STATUS_CLAIMED:
+            continue
+        if _row_starts_today(row) is False:
+            continue        # 昨天那一窗的，不补（今天开窗后会领到新的）
+        campaign_id = str(row.get("campaignId") or "").strip()
+        if not campaign_id:
+            continue
+        url = f"{qd.open_api(creds['region'])}{qd.CAMPAIGNS_PATH}/{campaign_id}/claim"
+        body, _status, _err = qd.api_json("POST", url, headers, {},
+                                         timeout=qd.CLAIM_TIMEOUT)
+        _note_grant_from(body or {})
+        return
 
 
 def _run() -> dict:
@@ -228,28 +379,38 @@ def _run() -> dict:
             return _out(result, f"活动列表查询失败（风控重拉）：{err or status}", streak=streak)
 
     rows = _campaign_rows(payload)
+    window_open = _window_open(rows)
     target, claimed = _pick_target(rows)
     if target is None:
-        # 上游确认今天窗口已领（可能是在 Qoder 客户端里领的）：10 点后的
-        # 「已领取」才是今天那一窗，计入本地天数；10 点前是昨天的成绩
-        if claimed and _in_today_window():
+        # 上游确认今天窗口已领（可能是在 Qoder 客户端里领的）：开窗后的
+        # 「已领取」才是今天那一窗，计入本地天数；开窗前读到的是昨天的成绩
+        if claimed and window_open:
             streak = _confirm_day(state)
-        return _no_claim(region, claimed, risk_note, streak)
+            # 台账缺今天这一笔就补记：`expiresAt` 只在 claim 响应里，而这条
+            # 路径从不调 claim——不补的话过期日历会缺笔目、把余额错挂到旧日期
+            _backfill_grant(creds, headers, rows)
+        return _no_claim(region, claimed, risk_note, streak, window_open=window_open)
 
     campaign_id = str(target.get("campaignId") or "").strip()
     if not campaign_id:
         return _out("ERROR", "Qoder 签到活动缺少活动标识，无法领取")
 
+    # 可领取的那一行本身是否属于今天这一窗。开窗前能领到的行属于「昨天那一窗」
+    # （窗口要到 09:59 才关）：真能领到就是真收益，照领不误，但文案要说清这不是
+    # 今天的份，免得用户以为今天已经领完、后面不用再跑。行里没时间戳时退回
+    # 「今天还没开窗 ⇒ 算上一窗」，宁可多提醒一句也不谎报今日已签。
+    row_today = _row_starts_today(target)
+    carry_over = (not row_today) if row_today is not None else (not window_open)
+
     url = f"{qd.open_api(region)}{qd.CAMPAIGNS_PATH}/{campaign_id}/claim"
     body, status, err = qd.api_json("POST", url, headers, {}, timeout=qd.CLAIM_TIMEOUT)
 
-    # 上游并发/重放时返回 409 + {"result":"ALREADY_CLAIMED"}，不是失败
+    # 上游并发/重放时返回 409 + {"result":"ALREADY_CLAIMED"}，不是失败。
+    # carry_over（上一窗）同一个道理：那是昨天的成绩，不记今天的连续天数
     if body is None and status == 409:
-        streak = _confirm_day(state)
-        return _out("ALREADY", f"今日已领取（连续 {streak} 天）", streak=streak)
+        return _claimed_already(state, streak, carry_over)
     if body is not None and str(body.get("result") or "") == RESULT_ALREADY_CLAIMED:
-        streak = _confirm_day(state)
-        return _out("ALREADY", f"今日已领取（连续 {streak} 天）", streak=streak)
+        return _claimed_already(state, streak, carry_over)
     if body is None:
         if status in (401, 403):
             return _out("NO_AUTH", f"领取被拒绝（HTTP {status}），请更新 accessToken",
@@ -261,8 +422,10 @@ def _run() -> dict:
         return _out("ALREADY", f"签到未完成（上游状态 {body.get('status') or '未知'}）",
                     streak=streak)
     if bool(body.get("replayed")):
-        streak = _confirm_day(state)
-        return _out("ALREADY", f"今日已领取（连续 {streak} 天）", streak=streak)
+        # 重放（今天已领过）同样带回权威 expiresAt：顺手补一笔台账，避免这条
+        # 路径漏记（它常年是「已领」时唯一能拿到到期时刻的地方）
+        _note_grant_from(body)
+        return _claimed_already(state, streak, carry_over)
 
     benefit = body.get("benefit") if isinstance(body.get("benefit"), dict) else {}
     try:
@@ -281,22 +444,23 @@ def _run() -> dict:
     # `expiresAt` 是上游返回的权威到期时刻 —— addOnQuota 接口不暴露逐笔到期时间，
     # 上游也没有领取历史接口，所以这个时刻只能在这里顺手记下来。
     # 交给 qoder_credits 读（本脚本只负责记，不参与总积分口径）。
-    expires_at = str(body.get("expiresAt") or "").strip()
-    if expires_at:
-        try:
-            import qoder_credits as qc
+    _note_grant_from(body)
 
-            qc.note_grant(reward, expires_at)
-        except Exception:
-            pass  # 台账失败不影响签到本身
-
-    streak = _confirm_day(state)
+    # 开窗前领到的是「昨天那一窗」的补领：积分真到账，但那是昨天的成绩，
+    # 不能算成今天已签，也不该把本地连续天数按今天 +1（否则明天再领会双计）
+    streak = streak if carry_over else _confirm_day(state)
     state["last_reward"] = reward
     state["region"] = region
     _save_state(state)
 
+    # 开窗前领到的是昨天那一窗的补领，不是今天的份额：照报 CLAIMED（真到账），
+    # 但 signed_today=False，别让面板把今天标成已完成
+    if carry_over:
+        return _out("CLAIMED", f"补领昨天那一窗：{message}（连续 {streak} 天）；"
+                    "今天的份额 10:00 开窗后可再领",
+                    today=reward, total=0, streak=streak, signed_today=False)
     return _out("CLAIMED", f"{message}（连续 {streak} 天）", today=reward, total=0,
-                streak=streak)
+                streak=streak, signed_today=True)
 
 
 def _status() -> dict:
@@ -330,6 +494,7 @@ def _status() -> dict:
                         streak=streak)
 
     rows = _campaign_rows(payload)
+    window_open = _window_open(rows)
     target, claimed = _pick_target(rows)
     region_label = "中国版" if region == qd.CN else "国际版"
 
@@ -341,13 +506,15 @@ def _status() -> dict:
                     "点签到即可领取",
                     streak=streak, signed_today=False)
     if claimed:
-        # 10 点前窗口还没刷新：此刻的「已领取」是昨天那一窗的，今天还没开始
-        if _in_today_window():
+        # 开窗前（10:00 前）窗口还没刷新：此刻的「已领取」是昨天那一窗的，今天
+        # 还没开始。必须显式 signed_today=False——旧版这里不置该字段，面板虽按
+        # 「不猜」显示未签到，但签到路径却报「今日已领取」，两条口径打架
+        if window_open:
             return _out("ALREADY", f"{region_label}：今日已领取（连续 {streak} 天）",
                         streak=streak, signed_today=True)
         return _out("ALREADY",
                     f"{region_label}：昨日已领取，今天 10:00 开窗后可再领",
-                    streak=streak)
+                    streak=streak, signed_today=False)
     if risk_note:
         return _out("ALREADY", f"{region_label}：未领取：{risk_note}", streak=streak)
     return _out("ALREADY", f"{region_label}：当前没有可领取的签到活动", streak=streak)

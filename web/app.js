@@ -8,6 +8,7 @@ const PLATFORM_ICON = {
   商汤小浣熊: "/static/icons/raccoon.png",
   qoder: "/static/icons/qoder.png",
   trae: "/static/icons/trae.png",
+  kuku: "/static/icons/kuku.png",
 };
 // 日志/卡片展示名：隐藏积分源（*_credits）与主平台脚本归一到同一平台名，
 // 不带「积分」后缀，避免运行日志里同一平台出现两种叫法。
@@ -23,6 +24,8 @@ const DISPLAY_NAMES = {
   qoder: "Qoder",
   qoder_credits: "Qoder",
   trae: "Trae",
+  kuku: "库库AI",
+  kuku_credits: "库库AI",
 };
 const displayName = (name) => DISPLAY_NAMES[name] || name;
 const iconFor = (name) => {
@@ -112,6 +115,8 @@ function badge(status, todayOk, probing) {
   return '<span class="badge fail">签到失败</span>';
 }
 function fmtNum(n) { return (n ?? 0).toLocaleString("en-US"); }
+// 卡片余额专用：null = 平台没读到余额（无积分活动/积分未知），显示「—」而不是 0
+function fmtCredits(n) { return n === null || n === undefined ? "—" : fmtNum(n); }
 function skeletonCards(n, h) {
   return Array.from({ length: n }, () =>
     `<div class="skeleton" style="height:${h}px"></div>`).join("");
@@ -187,9 +192,9 @@ function renderOverview(d) {
         <div class="pc-name"><span class="pc-icon"><img src="${iconFor(p.name)}" width="30" height="30" alt=""></span>${esc(p.name)}</div>
         ${badge(p.status, p.today_ok, p.probing)}
       </div>
-      <div class="pc-credits">${fmtNum(p.credits)}</div>
+      <div class="pc-credits">${fmtCredits(p.credits)}</div>
       <div class="pc-meta">
-        当前累计积分<br>
+        当前累计积分${p.credits === null || p.credits === undefined ? "（暂无可读余额）" : ""}<br>
         连续 <b>${p.streak}</b> 天${p.has_expiring
           ? (p.earliest_expiring ? ` · 最早 <b>${p.earliest_expiring.slice(5)}</b> 到期` : "") + (p.expiring_14d ? ` · 14 天内 <b>${fmtNum(p.expiring_14d)}</b> 分到期` : "")
           : " · 平台未返回有效期"}
@@ -239,8 +244,18 @@ async function runOne(name, btn) {
   if (btn) { btn.disabled = true; btn.textContent = "签到中…"; }
   try {
     const r = await api(`/api/run/${encodeURIComponent(name)}`, { method: "POST" });
-    if (r.result === "CLAIMED")
-      toast(`${name} 签到成功`, `${r.report || "完成"} · 连续签到重新计数见明细`, "ok");
+    // 三种口径要分开说，别一律报「今日已签」：
+    // - CLAIMED + signed_today !== false：真领到了今天的份额；
+    // - CLAIMED + signed_today === false：领到的是上一窗的补领（脚本自己说清了）；
+    // - ALREADY + signed_today === false：脚本明确「今天还没签」（例如 Qoder
+    //   10:00 才开窗，此刻读到的是昨天的成绩）。旧版这里报绿字「今日已签」，
+    //   用户以为今天的积分已经到手，其实一分没进账——这正是误导的来源。
+    if (r.result === "CLAIMED" && r.signed_today === false)
+      toast(`${name} 已领取（非今日份额）`, r.report || "本轮领到的是上一窗口的额度", "warn");
+    else if (r.result === "CLAIMED")
+      toast(`${name} 签到成功`, r.report || "完成", "ok");
+    else if (r.result === "ALREADY" && r.signed_today === false)
+      toast(`${name} 暂时还签不了`, r.report || "今天还没到可领取的时刻", "warn");
     else if (r.result === "ALREADY")
       toast(`${name} 今日已签`, r.report || "已签到，跳过", "ok");
     else
@@ -259,14 +274,20 @@ $("#btn-run-all").addEventListener("click", async (ev) => {
     const r = await api("/api/run_all", { method: "POST" });
     const ok = r.results.filter((x) => x.ok).length;
     const fail = r.results.filter((x) => !x.ok);
+    // 脚本明确「今天还没签」（如 Qoder 10:00 前）不算失败，但也别计入成功，
+    // 否则「5 / 5 个平台成功」会让人以为今天的分全领到了
+    const waiting = r.results.filter((x) => x.ok && x.signed_today === false);
+    const waitNote = waiting.length
+      ? `；暂不可签：${waiting.map((x) => x.platform).join("、")}` : "";
     // 隐藏的积分源（如 workbuddy_credits）跑失败时，卡片上的总积分会是旧值
     const credFail = (r.credit_sources || []).filter((x) => !x.ok);
     const credNote = credFail.length
       ? `；积分刷新失败：${credFail.map((c) => c.source_for || c.platform).join("、")}`
       : "";
-    toast(`一键签到完成`, `${ok} / ${r.ran} 个平台成功` +
-      (fail.length ? `，失败：${fail.map((f) => f.platform).join("、")}` : "") + credNote,
-      fail.length || credFail.length ? "fail" : "ok");
+    toast(`一键签到完成`, `${ok - waiting.length} / ${r.ran} 个平台成功` +
+      (fail.length ? `，失败：${fail.map((f) => f.platform).join("、")}` : "") +
+      waitNote + credNote,
+      fail.length || credFail.length ? "fail" : waiting.length ? "warn" : "ok");
     loadOverview();
   } catch (e) { toast("一键签到失败", e.message, "fail"); }
   btn.disabled = false; btn.textContent = "一键全部签到";

@@ -137,8 +137,22 @@ def _expiring_from_grants(rows: list[dict], quota_remaining: int) -> list[dict]:
     """把台账按到期日聚合，只保留今天及以后的份额。
 
     `quota_remaining` 是 addOnQuota 的真实剩余：台账里的原始发放额可能已被
-    消耗掉一部分，逐笔照搬会虚高。按「剩余 ≤ 台账合计」的比例等比摊薄，
-    让日历上的到期总额等于真实会到期的量（与小浣熊积分源同一思路）。
+    消耗掉一部分，逐笔照搬会虚高。按积分池的先进先出行为摊薄：**消耗吃掉最早
+    到期的笔目，剩余积分完整保留在较晚到期的笔目上**——花掉的 2900 分落在老
+    笔目上，手里剩的 100 分是最近发放的那笔（与小浣熊 `_cap_to_daily_balance`、
+    库库 `parse_expiring_records` 同一口径）。
+
+    旧实现把余额从**最早**到期笔目起填（`take = min(amount, remaining)` 顺序补），
+    等于「先花新积分、留着快过期的」——与积分池实际行为相反：真机 2026-11-10
+    余额 100 却报「11-11 到期 100」，而池子里剩的是最新那笔（12-10 到期）。
+
+    余额为 0（2026-11-09 修正）：addon_remaining == 0 表示资源包已被消耗干净
+    （或整个账号没有积分了），真实的「会因到期损失」的积分为 0，直接返回空数组。
+    旧实现 `scale = 1.0 if total <= 0 or quota_remaining <= 0 else …` 把 0 当成
+    「无从摊薄」退回原额相加——积分用完后过期日历仍挂着台账里全部 17 笔
+    100 分（真机 2026-11-09：余额 0 却报 17 笔到期），虚报比不报更糟。
+    账本对 ALREADY 正常回报照常覆盖（未来行按平台整体重建），空数组不会残留
+    旧快照，只会如实清空日历上的 Qoder 格子。
     """
     today = time.strftime("%Y-%m-%d")
     buckets: dict[str, float] = {}
@@ -158,14 +172,44 @@ def _expiring_from_grants(rows: list[dict], quota_remaining: int) -> list[dict]:
     if not buckets:
         return []
 
-    total = sum(buckets.values())
-    scale = 1.0 if total <= 0 or quota_remaining <= 0 else min(1.0, quota_remaining / total)
+    try:
+        remaining = float(quota_remaining)
+    except (TypeError, ValueError):
+        return []
+    if remaining <= 0:
+        return []               # 钱包已空：没有任何一笔会因到期而损失
+
+    # 按到期日升序（最早在前），先进先出扣减：消耗从最早到期的笔目起吃，
+    # 一路吃到余额为止；剩下的份额就是真实还会因到期损失的部分。
+    ordered = sorted(buckets.items())
+    total = sum(amount for _day, amount in ordered)
+    consumed = total - remaining        # 已花掉（含已到期作废）的部分
 
     out = []
-    for day in sorted(buckets):
-        amount = buckets[day] * scale
-        if amount >= 1:
-            out.append({"date": day, "amount": int(round(amount)), "source": "每日签到"})
+    for day, amount in ordered:
+        if consumed <= 0:
+            held = amount               # 消耗已吃完，这笔完整保留
+        elif consumed >= amount:
+            consumed -= amount          # 这笔被吃光
+            continue
+        else:
+            held = amount - consumed    # 这笔被吃剩一部分
+            consumed = 0
+        if held >= 1:
+            out.append({"date": day, "amount": int(round(held)), "source": "每日签到"})
+
+    # 余额仍大于台账合计：台账缺了笔目（脚本读到 CLAIMED 就不再调 claim、
+    # 拿不到 expiresAt，见 qoder.py 的领取分支）。这些差额是真实持有、终将
+    # 过期的积分，静默丢弃就是漏报——挂到已知的最晚到期日（最近发放的那笔
+    # 最可能就是它，与先进先出的剩余归属一致）。
+    gap = remaining - total
+    if gap >= 1 and ordered:
+        last = out[-1] if out else None
+        if last is not None and last["date"] == ordered[-1][0]:
+            last["amount"] += int(round(gap))
+        else:
+            out.append({"date": ordered[-1][0], "amount": int(round(gap)),
+                        "source": "每日签到"})
     return out
 
 

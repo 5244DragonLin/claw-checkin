@@ -51,6 +51,79 @@ DESKTOP_HEADERS = [
 ]
 REQUEST_TIMEOUT = 25
 
+# ── 账单接口：v2 游标翻页（临期日历取数必须用它）─────────────────
+# 2026-11-10 实测：v1 `/api/web/points/v1/bills` 的 limit 被服务端**封顶 100**，
+# 且 `paging.offset > 0` 一律回空 —— 翻页彻底失效。重度使用账号一天就有上百条
+# 「桌面端 LLM 对话消耗」，100 条的窗口只覆盖不到一天，7 天有效期的每日积分
+# 发放笔目里只剩最早那 1 笔可见。积分源因此把 2050 的余额整笔挂到单个到期日
+# （日历上「11-16 有 2050 分过期」），而官网明细是 11-10→11-16 每天一笔 300。
+#
+# v2 `/api/web/points/v2/bills` 带游标翻页（has_more / next_cursor），实测能
+# 稳定翻到任意深度。故改用 v2 翻页取数，v1 仅作兜底（v2 不可用时退回老路径，
+# 拿到的窗口更浅，但至少不会整个功能失效）。
+PATH_BILLS_V2 = "/api/web/points/v2/bills"
+PATH_BILLS_V1 = "/api/web/points/v1/bills"
+BILLS_PAGE_SIZE = 100          # v2 实测 100 是服务端单页上限
+BILLS_MAX_PAGES = 40           # 上限保险：40×100=4000 条，远超任何临期窗口需要
+BILLS_TIMEOUT = 30
+
+
+def fetch_bills(access: str, stop_before_day: str = "", timeout: int = BILLS_TIMEOUT
+                ) -> tuple[dict | None, int, str]:
+    """取账单流水，v2 游标翻页翻到 `stop_before_day` 之前为止。
+
+    返回信封形状与单页调用一致（{"items": [...], "paging": {...}}），调用方
+    不必区分单页 / 翻页。`stop_before_day`（YYYY-MM-DD）用于提前收工：一旦某页
+    最旧一条的日期已早于它，后续页不可能再有本次要用的笔目（列表按时间倒序），
+    直接停翻，省掉重度账号可能几十页的往返。
+
+    v2 不可用（404/网络异常）时退回 v1 单页：窗口更浅，但至少不整块失效。
+    """
+    items: list[dict] = []
+    cursor = ""
+    for page in range(BILLS_MAX_PAGES):
+        query = f"?paging.limit={BILLS_PAGE_SIZE}&paging.offset=0"
+        if cursor:
+            query += f"&cursor={cursor}"
+        payload, status, err = api_json(
+            "GET", f"{PATH_BILLS_V2}{query}", access, timeout=timeout)
+        if payload is None:
+            if page == 0:
+                # v2 整块不可用：退回 v1 单页口径（老路径，窗口浅但不至于没有）
+                return api_json(
+                    "GET",
+                    f"{PATH_BILLS_V1}?paging.limit={BILLS_PAGE_SIZE}&paging.offset=0",
+                    access, timeout=timeout)
+            # 翻到中途失败：已拿到的页仍然可用（不丢已取数据），如实返回
+            break
+        rows = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or not rows:
+            break
+        items.extend(r for r in rows if isinstance(r, dict))
+        if stop_before_day and _oldest_day(rows) and _oldest_day(rows) < stop_before_day:
+            break
+        if not payload.get("has_more"):
+            break
+        nxt = str(payload.get("next_cursor") or "")
+        if not nxt or nxt == cursor:
+            break          # 游标没前进：防死循环
+        cursor = nxt
+    return {"items": items, "paging": {"total": len(items)}}, 200, ""
+
+
+def _oldest_day(rows: list[dict]) -> str:
+    """一页里最旧一条的日期（YYYY-MM-DD）；无法解析返回空。
+
+    列表按时间倒序，但保险起见取全页最小值——只靠「最后一条」会在上游改变
+    排序时误判提前收工。
+    """
+    days = []
+    for row in rows:
+        day = str(row.get("created_at") or "")[:10]
+        if len(day) == 10 and day[4] == "-" and day[7] == "-":
+            days.append(day)
+    return min(days) if days else ""
+
 
 def main_site() -> str:
     value = (os.environ.get("RACCOON_MAIN_SITE_URL") or "").strip().rstrip("/")

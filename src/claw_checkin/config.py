@@ -40,6 +40,10 @@ class ProbeConfig:
     """状态核查：只读查询「今天在平台侧签过没有」，用于承认别处签的到。"""
     enabled: bool = True
     debounce: int = 30            # 同一台机器两次核查的最小间隔（秒），0 关闭防抖
+    # 「今天确实没签」这类否定结论的保鲜期（分钟）：过期后重新核查。
+    # 有些平台的开窗时刻晚于用户打开面板的时刻（Qoder 每天 10:00），把上午
+    # 8 点那句「还没开窗」锁一整天，卡片就再也不会自己变绿
+    deny_ttl_minutes: int = 30
 
 
 @dataclass
@@ -81,7 +85,7 @@ _DEFAULTS = {
     "scripts": {"dir": "scripts", "timeout": 120},
     "schedule": {"enabled": True, "time": "10:30"},
     "credits": {"refresh_interval": 300, "page_load_debounce": 30},
-    "probe": {"enabled": True, "debounce": 30},
+    "probe": {"enabled": True, "debounce": 30, "deny_ttl_minutes": 30},
     "ledger": {"db": "data/ledger.json", "retention_days": 30,
                "snapshot_retention_days": 31},
     "logging": {"level": "INFO", "file": ""},

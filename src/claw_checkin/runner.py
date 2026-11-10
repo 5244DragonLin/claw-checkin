@@ -15,6 +15,15 @@ signed_today 的意义：面板默认只承认自己触发的签到动作。用�
 别的签到工具）先签了，面板无从得知，只能显示「未签到」。脚本在**确有证据**
 （平台返回今日已签/今日已领取）时置 true，面板据此把卡片标成已签到；
 拿不准就不填——填错会让面板谎报，比显示未签到更糟。
+
+三态口径（2026-11-10 起）：
+  · true  = 确证今天已签 → 卡片标已签到；
+  · false = 确证今天**没**签（例如「现在还没到开窗时刻，读到的是昨天的成绩」）
+            → 卡片维持未签到，即使这次运行的 trigger 是手动签到；
+  · 缺省  = 说不准（查不到/接口没这个信息）→ 不参与判断。
+false 必须能压过「manual + ALREADY 就算今天签过」的默认规则：Qoder 的窗口
+10:00 才开，10 点前签到脚本读到的是昨天那一窗的 CLAIMED，若沿用默认规则，
+面板会把卡片标成「今日已完成」并把按钮置灰，而今天 100 credits 其实一分没到。
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ class RunResult:
     total_credits: int | None = None
     expiring: list = field(default_factory=list)
     signed_today: bool = False       # 平台侧确认今日已签（见模块说明）
+    signed_today_known: bool = False  # 脚本是否就「今天签没签」明确表态（true/false 都算）
     raw: str = ""                    # stdout 原文
     parse_ok: bool = False
     error: str = ""                  # 执行/解析失败原因
@@ -62,6 +72,7 @@ class RunResult:
             "total_credits": self.total_credits,
             "expiring": self.expiring,
             "signed_today": self.signed_today,
+            "signed_today_known": self.signed_today_known,
             "raw": self.raw,
             "parse_ok": self.parse_ok,
             "error": self.error,
@@ -118,8 +129,12 @@ def run_script(platform: str, path, command: list[str], timeout: int = 120) -> R
         if isinstance(exp, list):
             rr.expiring = [e for e in exp if isinstance(e, dict) and e.get("date")]
         # 只认明确的布尔真值：字符串 "false"、0、缺失都按「没有证据」处理，
-        # 不能让脏字段把平台谎报成已签到
-        rr.signed_today = data.get("signed_today") is True
+        # 不能让脏字段把平台谎报成已签到。但布尔 false 是脚本的**明确表态**
+        # （「今天确实没签」），单独记在 signed_today_known 里，供面板否决
+        # 「手动签到 + ALREADY 就算今天签过」的默认规则
+        value = data.get("signed_today")
+        rr.signed_today = value is True
+        rr.signed_today_known = isinstance(value, bool)
         if rr.result not in RESULT_ENUM:
             rr.result = "ERROR"
             rr.error = f"result 取值越界：{rr.result!r}（六枚举之外）"
@@ -175,7 +190,10 @@ def health_check(info: ScriptInfo, timeout: int = 120) -> dict:
     ]
 
     if first.parse_ok:
-        missing = [f for f in REQUIRED_FIELDS if first.__dict__.get(f) is None]
+        # 「字段齐全」看的是契约字段**存在与否**，不是值是否为 None——null 是
+        # 合法值（读不到余额时输出 null，面板回退上一次已知值），把 null 当
+        # 缺失会让「余额未知的正常回报」过不了体检（2026-11-09 库库踩中）
+        missing = [f for f in REQUIRED_FIELDS if f not in first.__dict__]
         checks[2]["status"] = "pass" if not missing else "fail"
         checks[2]["detail"] = "字段齐全" if not missing else f"缺少 {', '.join(missing)}"
         checks[3]["status"] = "pass" if first.result in RESULT_ENUM and first.result != "ERROR" else "fail"

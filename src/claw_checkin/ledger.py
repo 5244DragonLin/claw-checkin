@@ -127,6 +127,23 @@ CHECKIN_TRIGGERS = ("schedule", "manual", "retry")
 PROBE_TRIGGER = "probe"
 
 
+def _signed_flag(rr) -> int:
+    """把脚本对「今天签没签」的表态落成三态整数。
+
+      1 = 明确已签（signed_today: true）
+      0 = 没表态（未实现该字段/查不到）
+     -1 = 明确**未**签（signed_today: false，例如「还没到开窗时刻，读到的是昨天的
+          成绩」）
+
+    只有布尔 false 才算明确否定；字符串 "false"、0 之类脏值一律按 0 处理，
+    与 runner 的宽容口径保持一致。存成整数是为了和既有账本行兼容（旧行只有
+    0/1，读出来自然按「没表态」/「已签」解释）。
+    """
+    if getattr(rr, "signed_today_known", False) and not getattr(rr, "signed_today", True):
+        return -1
+    return 1 if getattr(rr, "signed_today", False) else 0
+
+
 class Ledger:
     def __init__(self, db_path: Path):
         db_path = Path(db_path)
@@ -304,7 +321,7 @@ class Ledger:
                 "total_credits": rr.total_credits,
                 "streak_days": rr.streak_days,
                 "report": rr.report,
-                "signed_today": 1 if getattr(rr, "signed_today", False) else 0,
+                "signed_today": _signed_flag(rr),
                 "raw": rr.raw,
                 "trigger": trigger,
                 "parse_ok": 1 if rr.parse_ok else 0,
@@ -422,6 +439,10 @@ class Ledger:
         - 任何触发方式下 signed_today=1 的记录——脚本明确声明「平台侧确认今天
           已签」。用户在平台客户端/别的签到工具先签了，面板自己没跑过签到，但
           平台已经给出今天的成绩，这就是今天的签到事实。
+        - 例外是 signed_today=-1（脚本明确说「今天确实没签」）：它**否决**同一
+          平台今天更早的签到动作。典型场景是 Qoder 每天 10:00 才开窗，10 点前
+          手动签到只能读到昨天那一窗的 CLAIMED——不算失败，但今天这 100
+          credits 没到账，卡片不该显示「今日已完成」把按钮置灰。
         排除的是体检/积分刷新的 ALREADY（signed_today 未置位）：那只是「脚本
         读到的账号现状」，可能是昨天签的、也可能只是查了下余额，不代表今天有
         签到动作。计入它们正是「早上打开面板四个平台全显示已签到」故障的根源。
@@ -433,14 +454,41 @@ class Ledger:
                     continue
                 if (row["trigger"] in CHECKIN_TRIGGERS
                         or row["result"] == "CLAIMED"
-                        or int(row.get("signed_today") or 0) == 1):
+                        or int(row.get("signed_today") or 0) != 0):
                     latest[row["platform"]] = row
-            return latest
+            # 最新一条明确说「今天没签」→ 该平台今天不算已签。
+            # 位置口径很重要：先核查（-1）后手动签到（也带 -1）应保持未签；
+            # 反过来 10:00 开窗后核查给出 +1，则要能把先前的 -1 翻过来
+            return {name: row for name, row in latest.items()
+                    if int(row.get("signed_today") or 0) != -1}
 
-    def platforms_signed_today(self, today: str) -> set[str]:
-        """今天已有「已签」结论的平台名（成功类），供状态核查跳过重复查询。"""
-        return {name for name, row in self.today_checkin_rows(today).items()
-                if row["result"] in ("CLAIMED", "ALREADY")}
+    def platforms_answered_today(self, today: str, deny_ttl_minutes: int = 5) -> set[str]:
+        """今天已由状态核查给出过结论的平台名（含「今天确实没签」的否定结论）。
+
+        与 today_checkin_rows 的区别：signed_today=-1 也算「问过了」——不然
+        每天 10 点前的每一次页面刷新都会为同一个「还没开窗」的平台重复打上游。
+
+        但否定结论必须带保鲜期（deny_ttl_minutes）：Qoder 08:27 的「还没开窗」
+        到 10:30 就已经过期，若一直锁着，之后打开面板永远不再复查，卡片会一直
+        停在未签到（用户的签到动作虽能救回来，但漏了手动点一次就白等一天）。
+        肯定结论（+1）不需要保鲜期：今天已领就是已领。
+        """
+        cutoff = (datetime.now() - timedelta(minutes=max(0, deny_ttl_minutes))
+                  ).isoformat(timespec="seconds")
+        with self._lock:
+            latest: dict[str, dict] = {}
+            for row in self._log:
+                if not row["ts"].startswith(today):
+                    continue
+                if row.get("trigger") != PROBE_TRIGGER:
+                    continue
+                latest[row["platform"]] = row
+        answered = set()
+        for name, row in latest.items():
+            flag = int(row.get("signed_today") or 0)
+            if flag != -1 or row["ts"] >= cutoff:
+                answered.add(name)
+        return answered
 
     def has_schedule_run_today(self, today: str) -> bool:
         """今天是否已有调度触发的签到记录（供调度器判重）。"""

@@ -37,11 +37,10 @@ import _raccoon_sync as rc  # noqa: E402  同目录共享模块：凭据漫游/�
 import _raccoon_expiry as rx  # noqa: E402  同目录共享模块：每日积分有效期自适应
 
 PATH_BALANCE = "/api/web/points/v1/balance"
-# limit 必须覆盖全部「未到期」的每日积分笔目（每天发 1 笔、7 天有效 → 至少 7 天
-# 的账），否则笔目合计会小于 daily_points 余额，_cap_to_daily_balance 会因
-# 「余额 > 笔目合计」原样返回，把差额从日历上静默丢掉（实测 limit=40 只捞到未来
-# 2 笔共 600，余额 1024，日历漏报 424）。200 实测可拿到全量（当前 133 条）。
-PATH_BILLS = "/api/web/points/v1/bills?paging.limit=200&paging.offset=0"
+# 账单取数走 rc.fetch_bills()（v2 游标翻页）：v1 的 limit 被服务端封顶 100 且
+# offset 翻页失效，重度账号一天上百条消耗，「7 天有效」的每日积分只剩 1 笔可见，
+# 余额差额会被整笔挂到单个到期日（2026-11-10 真机：11-16 一格 2050 分，而官网
+# 是 11-10→11-16 每天一笔 300）。翻到「最早到期日之前」即可停，见 fetch_bills。
 
 # 钱包字段 → 展示名（顺序与 agent2api WALLET_LABELS 一致，只展示非零项）
 WALLET_LABELS = [
@@ -111,8 +110,11 @@ def main() -> int:
     # 即将过期（900 vs 实际剩余 867），按余额摊薄后才等于真实会到期损失的积分。
     today = time.strftime("%Y-%m-%d")
     expiring = []
-    bills, _bills_status, _bills_err = rc.api_json(
-        "GET", PATH_BILLS, creds["access"], timeout=30)
+    # 翻页只翻到「最早到期日之前」：每日积分 7 天有效，往回多留 2 天缓冲，
+    # 足以覆盖全部未到期笔目 + 到期当日的那次捕获（见 _raccoon_expiry）
+    floor_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - 9 * 86400))
+    bills, _bills_status, _bills_err = rc.fetch_bills(
+        creds["access"], stop_before_day=floor_day, timeout=30)
     if bills is not None:
         expiring = rx.daily_expiring_from_bills(bills, today, daily_points)
 

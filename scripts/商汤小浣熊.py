@@ -56,10 +56,11 @@ import _raccoon_sync as rc  # noqa: E402  同目录共享模块：凭据漫游/�
 
 PATH_GRANT = "/api/web/desktop/v1/login/points/grant"
 PATH_SETTING = "/api/web/office/v3/setting_info"
-# limit 与积分源保持一致：覆盖全部未到期的每日积分笔目（7 天有效期 → 至少 7 天）
-PATH_BILLS = "/api/web/points/v1/bills?paging.limit=200&paging.offset=0"
+# 账单核对走 rc.fetch_bills()（v2 游标翻页）：v1 的 limit 被服务端封顶 100 且
+# offset 翻页失效，重度账号一天就有上百条消耗，今日的签到入账会被挤出窗口，
+# 「今日已签到」被误判成「今日未见入账」（2026-11-10 实测）。
 PATH_BALANCE = "/api/web/points/v1/balance"
-BILLS_TIMEOUT = 30      # 账单接口实测约 9 秒，独立超时兜底（agent2api 同款）
+BILLS_TIMEOUT = 30      # 账单接口实测约 1~9 秒，独立超时兜底（agent2api 同款）
 
 # 签到相关的账单事件（实测口径，2026-10）：
 #   每日积分发放 —— 每日签到收益：默认当日 24:00 清零，当天登录（含本脚本
@@ -164,8 +165,10 @@ def _run() -> dict:
     _grant, setting = _grant_flow(creds["access"])
 
     # ③ 账单核对今日入账（失败按 NETWORK 处理：不更新本地状态，下次重跑可补认）
-    bills, bills_status, bills_err = rc.api_json(
-        "GET", PATH_BILLS, creds["access"], timeout=BILLS_TIMEOUT)
+    #    翻到「今天之前」即可停：列表按时间倒序，一旦某页已出现昨天的记录，
+    #    今天的入账就全部落在已翻过的页里——本步只关心今天的入账
+    bills, bills_status, bills_err = rc.fetch_bills(
+        creds["access"], stop_before_day=today, timeout=BILLS_TIMEOUT)
     if bills is None:
         if bills_status == 401:
             return _out("NO_AUTH", "登录态被上游拒绝（续期后仍 401），"
@@ -237,8 +240,10 @@ def _status_probe() -> dict:
         return _out("NO_AUTH", f"未找到小浣熊登录凭据（{where} 均无）",
                     0, state["streak_days"], state["last_total"])
 
-    bills, status, err = rc.api_json("GET", PATH_BILLS, creds["access"],
-                                     timeout=BILLS_TIMEOUT)
+    bills, status, err = rc.fetch_bills(
+        creds["access"], stop_before_day=time.strftime(
+            "%Y-%m-%d", time.localtime(time.time() - 86400)),
+        timeout=BILLS_TIMEOUT)
     if bills is None:
         if status == 401:
             return _out("NO_AUTH", "账单查询被拒绝（HTTP 401），请重新登录小浣熊桌面端",
